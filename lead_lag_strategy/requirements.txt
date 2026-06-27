@@ -1,0 +1,8 @@
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+pyarrow>=14.0.0       # parquet caching
+statsmodels>=0.14.0   # factor regression (OLS + HAC)
+pandas-datareader>=0.10.0  # Fama-French factor data
+seaborn>=0.12.0       # propagation matrix heatmap (optional)

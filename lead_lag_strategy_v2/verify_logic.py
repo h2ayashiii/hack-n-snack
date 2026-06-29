@@ -39,6 +39,7 @@ It prints a metrics table and writes a multi-panel figure.
 from __future__ import annotations
 
 import argparse
+import os
 import numpy as np
 import pandas as pd
 
@@ -244,6 +245,7 @@ def make_figure(syn, acc_df, rets, metrics, out_path):
 
     fig.suptitle("Verification of subspace-regularized PCA lead-lag logic "
                  "(synthetic idealized model)", fontsize=13, y=0.98)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
     print(f"[figure] written to {out_path}")
 
@@ -253,7 +255,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--days", type=int, default=1500)
-    ap.add_argument("--out", default="verify_logic.png")
+    ap.add_argument("--out", default=os.path.join("output", "verify_logic.png"))
     args = ap.parse_args()
 
     print("=" * 70)

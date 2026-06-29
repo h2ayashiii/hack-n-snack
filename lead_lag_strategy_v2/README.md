@@ -169,12 +169,29 @@ MDD -9.58% と、リスク調整後リターンと最大ドローダウンの両
 
 ## 3. セットアップ
 
+[uv](https://docs.astral.sh/uv/) を使ってパッケージを管理します。
+
+### uv のインストール（未導入の場合）
+
 ```bash
-python3 -m pip install numpy pandas matplotlib scipy
-python3 -m pip install yfinance        # realtime_run.py のライブ取得に使用（任意）
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Python 3.9+ で動作確認済み。
+### 依存パッケージのインストール
+
+```bash
+cd lead_lag_strategy_v2
+
+# 基本パッケージ（numpy・pandas・matplotlib・scipy）をインストール
+uv sync
+
+# yfinance も含めてインストール（realtime_run.py のライブ取得を使う場合）
+uv sync --extra live
+```
+
+`uv sync` は `pyproject.toml` と `uv.lock` に基づいて仮想環境（`.venv/`）を自動作成します。
+
+Python 3.9+ で動作確認済み（`.python-version` により 3.12 を既定使用）。
 
 ---
 
@@ -183,9 +200,9 @@ Python 3.9+ で動作確認済み。
 ### 4.1 ロジック検証
 
 ```bash
-python3 verify_logic.py                       # 既定（seed=0, 1500日）
-python3 verify_logic.py --seed 1 --days 2000  # 別シード・期間
-python3 verify_logic.py --out my_fig.png      # 図の出力先を変更
+uv run python verify_logic.py                       # 既定（seed=0, 1500日）
+uv run python verify_logic.py --seed 1 --days 2000  # 別シード・期間
+uv run python verify_logic.py --out my_fig.png      # 図の出力先を変更
 ```
 
 標準出力に以下を表示し、図を保存する:
@@ -199,12 +216,14 @@ python3 verify_logic.py --out my_fig.png      # 図の出力先を変更
 
 ### 4.2 リアルタイム実行
 
+yfinance によるライブ取得を使う場合は `uv sync --extra live` でインストールしてください。
+
 ```bash
-python3 realtime_run.py                 # 1回スナップショット（チャートも保存）
-python3 realtime_run.py --no-chart      # テキストのみ
-python3 realtime_run.py --offline       # ネットワークを使わず合成データで実行
-python3 realtime_run.py --watch 300     # 300秒ごとに更新（Ctrl-Cで停止）
-python3 realtime_run.py --L 60 --lam 0.9 --K 3 --q 0.3   # パラメータ指定
+uv run python realtime_run.py                 # 1回スナップショット（チャートも保存）
+uv run python realtime_run.py --no-chart      # テキストのみ
+uv run python realtime_run.py --offline       # ネットワークを使わず合成データで実行
+uv run python realtime_run.py --watch 300     # 300秒ごとに更新（Ctrl-Cで停止）
+uv run python realtime_run.py --L 60 --lam 0.9 --K 3 --q 0.3   # パラメータ指定
 ```
 
 教師あり学習ではなく PCA（教師なし）であるため、リアルタイム出力は

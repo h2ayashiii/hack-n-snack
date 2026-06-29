@@ -1,0 +1,17 @@
+[project]
+name = "lead-lag-strategy-v2"
+version = "0.1.0"
+description = "Lead-lag strategies for Japanese and U.S. sectors using subspace regularization PCA"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+    "scipy>=1.10.0",
+]
+
+[project.optional-dependencies]
+live = [
+    "yfinance>=0.2.40",
+]

@@ -160,9 +160,24 @@ def build_C0(C_full: np.ndarray, V0: np.ndarray) -> np.ndarray:
         D0     = diag( V0^T C_full V0 )          (eq. 10)
         C_raw  = V0 D0 V0^T                       (eq. 11)
         C0     = Delta^-1/2 C_raw Delta^-1/2      (eq. 12)  with Delta = diag(C_raw)
+
+    ``C_full`` may contain NaN rows/columns for tickers with no quotes in
+    the prior window (e.g. XLC before its 2018-06 inception when the prior
+    is the paper's 2010-2014 period).  Each prior eigenvalue is then taken
+    as the Rayleigh quotient of the prior direction restricted to the
+    observed sub-block, which reduces to eq. (10) when nothing is missing.
     """
-    D0 = np.diag(np.diag(V0.T @ C_full @ V0))
-    C_raw = V0 @ D0 @ V0.T
+    C_full = np.asarray(C_full, dtype=float)
+    K0 = V0.shape[1]
+    avail = ~np.isnan(np.diag(C_full))
+    C_sub = np.nan_to_num(C_full[np.ix_(avail, avail)], nan=0.0)
+    d0 = np.empty(K0)
+    for k in range(K0):
+        v = V0[avail, k]
+        nrm2 = v @ v
+        d0[k] = (v @ C_sub @ v) / nrm2 if nrm2 > 1e-12 else 1.0
+    d0 = np.clip(d0, 1e-8, None)
+    C_raw = V0 @ np.diag(d0) @ V0.T
     d = np.sqrt(np.clip(np.diag(C_raw), 1e-12, None))
     C0 = C_raw / np.outer(d, d)
     # enforce exact unit diagonal
@@ -236,19 +251,17 @@ def double_sort_weights(sig_a: np.ndarray, sig_b: np.ndarray) -> np.ndarray:
     """2x2 double sort (Section 4.3, DOUBLE).
 
     Median-split each signal into High/Low.  Long  High_a & High_b,
-    short Low_a & Low_b, equal weight, dollar neutral.
+    short Low_a & Low_b, equal weight, dollar neutral.  If either
+    intersection is empty the book stays flat so that sum(w) = 0 holds
+    on every day, matching the neutrality of eq. (6).
     """
     ma, mb = np.median(sig_a), np.median(sig_b)
     high = (sig_a >= ma) & (sig_b >= mb)
     low = (sig_a < ma) & (sig_b < mb)
     w = np.zeros(len(sig_a))
-    if high.any():
-        w[high] = 1.0 / high.sum()
-    if low.any():
-        w[low] = -1.0 / low.sum()
-    # de-mean to enforce dollar neutrality if the two legs differ in size
     if high.any() and low.any():
-        pass
+        w[high] = 1.0 / high.sum()
+        w[low] = -1.0 / low.sum()
     return w
 
 

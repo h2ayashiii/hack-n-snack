@@ -70,7 +70,14 @@ def ensure_output_dir(path: str) -> str:
 # Data acquisition
 # ---------------------------------------------------------------------------
 def fetch_prices(prior_start="2010-01-01"):
-    """Download open/close prices via yfinance from prior_start to today."""
+    """Download open/close prices via yfinance from prior_start to today.
+
+    Following Section 4.1 of the paper, only days on which *both* markets
+    actually traded are kept (a day counts when a majority of each
+    market's ETFs has a fresh quote).  Late-inception tickers (XLRE
+    2015-10, XLC 2018-06) keep NaN before their first quote instead of
+    truncating the early history that the 2010-2014 prior window needs.
+    """
     import yfinance as yf
 
     tickers = C.US_TICKERS + C.JP_TICKERS
@@ -82,11 +89,16 @@ def fetch_prices(prior_start="2010-01-01"):
 
     open_ = raw["Open"][tickers]
     close = raw["Close"][tickers]
+
+    us_live = close[C.US_TICKERS].notna().sum(axis=1) > len(C.US_TICKERS) // 2
+    jp_live = close[C.JP_TICKERS].notna().sum(axis=1) > len(C.JP_TICKERS) // 2
+    common_days = us_live & jp_live
+    open_ = open_.loc[common_days]
+    close = close.loc[common_days]
+
+    # patch isolated per-ticker gaps only; pre-inception NaN stays NaN
     close = close.ffill(limit=2)
     open_ = open_.ffill(limit=2)
-    good = close.dropna(how="any")
-    open_ = open_.loc[good.index]
-    close = good
     if len(close) < 120:
         raise RuntimeError(f"insufficient history ({len(close)} rows)")
     return open_, close
@@ -126,18 +138,27 @@ def get_data(prior_start="2010-01-01", allow_network=True):
 # ---------------------------------------------------------------------------
 # Prior estimation (shared across all snapshots)
 # ---------------------------------------------------------------------------
-def build_prior(close_df, tickers, prior_end="2014-12-31", prior_days=400):
-    """Build the fixed C0 prior from the training period."""
+def build_prior(close_df, tickers, prior_start="2010-01-01",
+                prior_end="2014-12-31", prior_days=400):
+    """Build the fixed C0 prior from the paper's 2010-2014 training period.
+
+    C_full is the pairwise-complete correlation over the prior window
+    (correlation is invariant to the per-column standardisation of
+    eq. (9), so ``DataFrame.corr`` matches eqs. (8)-(9) while tolerating
+    tickers that list mid-window).  Tickers with no quotes at all in the
+    window (XLC, XLRE) are handled inside :func:`common.build_C0`.
+    """
     rcc = C.close_to_close_returns(close_df[tickers])
     V0 = C.build_prior_vectors(tickers)
-    prior_mask = rcc.index <= pd.Timestamp(prior_end)
-    rcc_v = rcc.values
-    if prior_mask.sum() >= prior_days:
-        prior_rcc = rcc_v[prior_mask]
-    else:
-        prior_rcc = rcc_v[:prior_days]
-    Zprior, _, _ = C.standardize_window(prior_rcc)
-    C_full = C.correlation_from_Z(Zprior)
+    prior_mask = ((rcc.index >= pd.Timestamp(prior_start))
+                  & (rcc.index <= pd.Timestamp(prior_end)))
+    prior_rcc = rcc.loc[prior_mask]
+    if len(prior_rcc) < prior_days:
+        print(f"[warn] only {len(prior_rcc)} rows in the prior window "
+              f"{prior_start}..{prior_end}; falling back to the first "
+              f"{prior_days} rows of the sample.", file=sys.stderr)
+        prior_rcc = rcc.iloc[:prior_days]
+    C_full = prior_rcc.corr(min_periods=60).values
     C0 = C.build_C0(C_full, V0)
     return rcc, C0
 
@@ -153,6 +174,11 @@ def snapshot_at(rcc: pd.DataFrame, C0: np.ndarray, signal_date,
     ----------
     signal_date : the date of the U.S. close we use as the signal (day t).
                   The prediction is for the JP open-to-close on day t+1.
+
+    U.S. tickers without complete data over the estimation window (e.g.
+    XLC before its 2018-06 inception) are dropped from that day's
+    estimation universe; the joint PCA then runs on the observed
+    cross-section, as in the paper's varying per-ticker sample (Table 1).
     """
     tickers = list(rcc.columns)
     idx = {t: i for i, t in enumerate(tickers)}
@@ -176,16 +202,36 @@ def snapshot_at(rcc: pd.DataFrame, C0: np.ndarray, signal_date,
         )
 
     window = rcc_v[pos - L:pos]
-    today_us = rcc_v[pos, us_idx]
+    today = rcc_v[pos]
 
-    res = C.compute_signal_for_day(window, today_us, us_idx, jp_idx,
-                                   C0, lam=lam, K=K)
+    avail = np.isfinite(window).all(axis=0) & np.isfinite(today)
+    if not avail[jp_idx].all():
+        raise ValueError(
+            f"Missing Japanese data in the window ending {actual_date.date()}"
+        )
+    us_avail = [int(i) for i in us_idx if avail[i]]
+    if len(us_avail) < K:
+        raise ValueError(
+            f"Only {len(us_avail)} U.S. tickers available on "
+            f"{actual_date.date()} (need at least K={K})"
+        )
+
+    # sub-universe kept in [U.S. block, JP block] order
+    sel = np.array(us_avail + list(jp_idx))
+    us_idx_sub = np.arange(len(us_avail))
+    jp_idx_sub = np.arange(len(us_avail), len(sel))
+    C0_sub = C0[np.ix_(sel, sel)]
+
+    res = C.compute_signal_for_day(window[:, sel], today[us_avail],
+                                   us_idx_sub, jp_idx_sub,
+                                   C0_sub, lam=lam, K=K)
     z_hat = res["z_hat_J"]
     w = C.long_short_weights(z_hat, q=q)
 
     return dict(source=source, signal_date=actual_date, z_hat=z_hat,
                 f=res["f"], evals=res["evals"], z_U=res["z_U"], w=w,
-                K=K, lam=lam, L=L, q=q, us_idx=us_idx, jp_idx=jp_idx)
+                K=K, lam=lam, L=L, q=q,
+                us_used=[tickers[i] for i in us_avail])
 
 
 def snapshot_range(rcc: pd.DataFrame, C0: np.ndarray, start_date, end_date,
@@ -230,6 +276,11 @@ def print_snapshot(s):
           f"(latest U.S. close-to-close)")
     print(f" predicting        : next Japanese open-to-close (t+1)")
     print(f" params            : L={s['L']}  lambda={s['lam']}  K={s['K']}  q={s['q']}")
+    us_used = s.get("us_used", C.US_TICKERS)
+    if len(us_used) < len(C.US_TICKERS):
+        missing = sorted(set(C.US_TICKERS) - set(us_used))
+        print(f" U.S. universe     : {len(us_used)}/{len(C.US_TICKERS)} "
+              f"(no data yet for {', '.join(missing)})")
     print(line)
 
     ev = s["evals"]
@@ -450,7 +501,8 @@ def main():
     ap.add_argument("--K", type=int, default=3, help="number of factors")
     ap.add_argument("--q", type=float, default=0.3, help="long/short quantile")
     ap.add_argument("--prior-start", default="2010-01-01",
-                    help="start date for yfinance download")
+                    help="download start and beginning of the prior "
+                         "(C_full) training window")
     ap.add_argument("--prior-end", default="2014-12-31",
                     help="end of prior training window")
     # Output
@@ -477,7 +529,8 @@ def main():
     def run_once():
         o, c, src = get_data(args.prior_start, allow_network=not args.offline)
         tickers = C.US_TICKERS + C.JP_TICKERS
-        rcc, C0 = build_prior(c, tickers, prior_end=args.prior_end)
+        rcc, C0 = build_prior(c, tickers, prior_start=args.prior_start,
+                              prior_end=args.prior_end)
 
         # --- Range mode ---
         if args.start_date:

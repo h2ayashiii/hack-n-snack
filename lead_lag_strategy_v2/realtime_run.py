@@ -104,13 +104,17 @@ def fetch_prices(prior_start="2010-01-01"):
     return open_, close
 
 
-def synthetic_window(seed=None):
-    """Fallback: generate a full history from the idealized model."""
+def synthetic_window(seed=None, start_date="2010-01-01"):
+    """Fallback: generate a full history from the idealized model.
+
+    The series runs up to today so the fallback stands in for live data
+    (same date range, same shape) rather than ending at a fixed offset.
+    """
     from verify_logic import make_synthetic
     if seed is None:
         seed = int(time.time()) % 100000
-    days = 4100
-    syn = make_synthetic(seed=seed, days=days, start_date="2010-01-01")
+    days = len(pd.bdate_range(start_date, dt.date.today()))
+    syn = make_synthetic(seed=seed, days=days, start_date=start_date)
     rcc = syn["rcc"]
     close = (1.0 + rcc).cumprod() * 100.0
     roc_J = syn["roc_J"].reindex(columns=C.JP_TICKERS)

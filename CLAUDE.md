@@ -85,17 +85,27 @@ python realtime_run.py --date 2024-11-01                   # specific date
 python realtime_run.py --start-date 2024-10-01 --end-date 2024-11-30  # range → heatmap
 python realtime_run.py --no-chart --offline                # text only, no network
 python realtime_run.py --watch 300                         # refresh every 300s
+
+# Daily e-mail report (see .github/workflows/daily-signal.yml)
+python daily_report.py --dry-run                           # render only → .eml + .html
+python daily_report.py --date 2024-11-01 --offline --dry-run
+python daily_report.py                                     # send (needs SMTP_* env)
 ```
 
-Outputs go to `output/` (gitignored). Single-date: `output/realtime_signal_YYYY-MM-DD.png`. Range: `output/realtime_signal_START_END.png` (RdYlGn heatmap, ▲=LONG / ▼=SHORT).
+Outputs go to `output/` (gitignored). Single-date: `output/realtime_signal_YYYY-MM-DD.png`. Range: `output/realtime_signal_START_END.png` (RdYlGn heatmap, ▲=LONG / ▼=SHORT). Daily report: `output/daily_report_YYYY-MM-DD.{eml,html}`.
 
 ### Architecture
-
-Everything lives in two files:
 
 - **`common.py`** — all math: return transforms, rolling standardisation, C0 prior construction (Gram-Schmidt), regularised PCA (`(1-λ)C_t + λC0`), lead-lag signal, long-short weights, performance metrics, full backtest loop (`run_backtest`)
 - **`realtime_run.py`** — data acquisition (yfinance with synthetic fallback), prior estimation, `snapshot_at(date)` / `snapshot_range(start, end)`, text and chart output
 - **`verify_logic.py`** — synthetic data generation from the idealized factor model; verifies Propositions 1–2 and reproduces Table 2
+- **`daily_report.py`** — reuses `realtime_run`'s `get_data` / `build_prior` / `snapshot_at`, then renders the snapshot as a multipart HTML+text e-mail (inline chart, trailing 20-session realised performance) and sends it via SMTP. Config comes from `SMTP_HOST/PORT/USER/PASSWORD/STARTTLS`, `REPORT_FROM/TO`; the defaults are `@example.com` mock addresses and an unset `SMTP_HOST` falls back to writing the message to disk.
+
+**Real-data handling** (`realtime_run.fetch_prices` / `build_prior`): only days both markets traded are kept; pre-inception NaN is preserved (XLRE 2015-10, XLC 2018-06) so the 2010–2014 prior window survives; U.S. tickers lacking a full estimation window are dropped from that day's joint PCA.
+
+### Scheduled run
+
+`.github/workflows/daily-signal.yml` runs `daily_report.py` at `30 22 * * 1-5` UTC — after the U.S. close, ~1.5h before the JP open. Scheduled runs pass `--require-live --skip-if-stale 0` so a synthetic or stale book is never mailed; `workflow_dispatch` exposes `date` / `dry_run` / `offline` inputs. Rendered output is always uploaded as an artifact. Note GitHub disables cron workflows after 60 days of repo inactivity.
 
 ---
 

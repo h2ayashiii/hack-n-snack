@@ -1,0 +1,116 @@
+name: Daily lead-lag signal
+
+# Runs the subspace-regularized PCA lead-lag model once per trading day and
+# e-mails the resulting long/short book.
+#
+# Timing follows the paper's convention: the U.S. close-to-close return on
+# day t predicts the Japanese open-to-close return on day t+1, so the job
+# has to land after the U.S. close and before the Japanese open.
+#
+#   22:30 UTC  =  18:30 ET (EST) / 17:30 ET (EDT)  -- 1.5-2.5h after the
+#                 U.S. close (21:00/20:00 UTC)
+#              =  07:30 JST next day               -- 1.5h before the
+#                 Japanese open (00:00 UTC)
+#
+# GitHub only guarantees best-effort scheduling and can delay cron runs by
+# several minutes to over an hour at peak times, so the window is kept wide.
+# Note also that GitHub disables scheduled workflows in a repository with no
+# activity for 60 days; push a commit or re-enable it from the Actions tab.
+
+on:
+  schedule:
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Signal date (YYYY-MM-DD). Empty = latest available."
+        required: false
+        type: string
+      dry_run:
+        description: "Render only, never open an SMTP connection"
+        required: false
+        type: boolean
+        default: false
+      offline:
+        description: "Use the synthetic fallback instead of the network"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-signal
+  cancel-in-progress: false
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: lead_lag_strategy_v2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: lead_lag_strategy_v2/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --extra live --frozen
+
+      - name: Build flags
+        id: flags
+        env:
+          IN_DATE: ${{ inputs.date }}
+          IN_DRY: ${{ inputs.dry_run }}
+          IN_OFFLINE: ${{ inputs.offline }}
+        run: |
+          flags=""
+          if [ -n "$IN_DATE" ]; then flags="$flags --date $IN_DATE"; fi
+          if [ "$IN_DRY" = "true" ]; then flags="$flags --dry-run"; fi
+          if [ "$IN_OFFLINE" = "true" ]; then
+            # Manual pipeline test on synthetic data: no freshness check,
+            # since simulated prices are never "today's market".
+            flags="$flags --offline"
+          else
+            # Never mail a synthetic book: fail loudly if prices are missing.
+            flags="$flags --require-live"
+            if [ -z "$IN_DATE" ]; then
+              # Nothing new to say on a day the two markets did not both
+              # trade, so exit quietly rather than re-mail yesterday's book.
+              flags="$flags --skip-if-stale 0"
+            fi
+          fi
+          echo "flags=$flags" >> "$GITHUB_OUTPUT"
+          echo "Using flags:$flags"
+
+      - name: Generate and send the daily signal
+        env:
+          # Configure these as repository secrets to enable real delivery.
+          # With SMTP_HOST unset the script falls back to a dry run and the
+          # rendered message is uploaded as a build artifact instead.
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_STARTTLS: ${{ secrets.SMTP_STARTTLS }}
+          # Mock defaults live in the script; override with repository
+          # variables (Settings -> Secrets and variables -> Actions -> Variables).
+          REPORT_FROM: ${{ vars.REPORT_FROM }}
+          REPORT_TO: ${{ vars.REPORT_TO }}
+        run: uv run python daily_report.py ${{ steps.flags.outputs.flags }}
+
+      - name: Upload rendered report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-signal-${{ github.run_id }}
+          path: lead_lag_strategy_v2/output/
+          if-no-files-found: ignore
+          retention-days: 30

@@ -169,6 +169,8 @@ MDD -9.58% と、リスク調整後リターンと最大ドローダウンの両
 | `common.py` | 共通ロジック（リターン変換・標準化・C0構成・正則化PCA・シグナル・ポートフォリオ・指標・バックテストループ） |
 | `verify_logic.py` | **ロジック検証**: 理想化モデルから合成データを生成し、命題1–2と表2の結論を再現。多面的な図を `output/verify_logic.png` に出力 |
 | `realtime_run.py` | **リアルタイム実行**: 最新データ（yfinance、失敗時は合成）から現時点の因子構造・シグナル・翌日のロング/ショート建玉を出力。チャートを `output/` に保存 |
+| `daily_report.py` | **日次レポート**: シグナルをHTML/テキストのメールとして生成し SMTP で送信（第5節） |
+| `../.github/workflows/daily-signal.yml` | **日次自動実行**: GitHub Actions の cron で毎営業日 `daily_report.py` を実行 |
 | `output/` | 生成されるチャート・図の出力先（git 管理外） |
 | `README.md` | 本ファイル |
 
@@ -279,7 +281,111 @@ python realtime_run.py --output-dir /tmp/charts # 出力先ディレクトリを
 
 ---
 
-## 5. 検証結果（合成データ）
+## 5. 日次自動実行とメール送信
+
+毎営業日、米国クローズ後・日本オープン前にシグナルを生成し、その内容を
+メールで配信する仕組みです。`daily_report.py`（生成と送信）と
+`.github/workflows/daily-signal.yml`（GitHub Actions の定期実行）の2つで
+構成されます。
+
+### 5.1 メールの内容
+
+| セクション | 内容 |
+|---|---|
+| ヘッダ | シグナル日 t、予測対象（翌JPセッション）、パラメータ、データソース |
+| Book | 翌セッションのロング5銘柄／ショート5銘柄と `zhat`・ウェイト |
+| 共通因子スコア | `f_t`（global / US-Japan spread / cyclical-defensive、式18） |
+| 実現パフォーマンス | 直近20営業日の PCA_SUB 実現リターン（累積・平均・勝率） |
+| チャート | 予測リターンの横棒グラフ（インライン画像として添付） |
+| 全ランキング | 日本17業種の `zhat_{J,t+1}` 降順 |
+
+HTML とプレーンテキストの `multipart/alternative` で送信するため、
+HTML 非対応のクライアントでも読めます。
+
+### 5.2 手動実行
+
+```bash
+# 生成のみ（SMTP に接続しない）→ output/daily_report_YYYY-MM-DD.{eml,html}
+python daily_report.py --dry-run
+
+# 特定日を指定してバックフィル／テスト（ネットワーク不要）
+python daily_report.py --date 2024-11-01 --offline --dry-run
+
+# 実際に送信（環境変数の設定が必要、5.3参照）
+python daily_report.py
+```
+
+主なオプション:
+
+| オプション | 意味 |
+|---|---|
+| `--dry-run` | SMTP に接続せず `.eml` と `.html` をファイル出力 |
+| `--require-live` | ライブ価格が取れない場合に合成データへフォールバックせず異常終了 |
+| `--skip-if-stale N` | 最新シグナル日が N 日より古ければ何も送らず正常終了（`--date` 指定時は無視） |
+| `--trailing-days N` | 実現パフォーマンス集計期間（既定20、`0` で無効） |
+| `--to` / `--from` | 宛先・差出人（環境変数より優先） |
+| `--no-chart` | チャートの生成と添付を省略 |
+
+### 5.3 メールアドレスと SMTP の設定
+
+**既定値はモック**です。`example.com` は RFC 2606 が文書用に予約している
+ドメインなので、未設定のまま実行しても実在のメールボックスには決して
+届きません。
+
+| 環境変数 | 既定値 | 用途 |
+|---|---|---|
+| `REPORT_TO` | `lead-lag-signals@example.com` | 宛先（カンマ区切りで複数可） |
+| `REPORT_FROM` | `lead-lag-bot@example.com` | 差出人 |
+| `SMTP_HOST` | （未設定） | **未設定ならドライラン**にフォールバック |
+| `SMTP_PORT` | `587` | `587`/`25` は STARTTLS、`465` は暗黙TLS |
+| `SMTP_USER` / `SMTP_PASSWORD` | （未設定） | 認証が必要な場合のみ |
+| `SMTP_STARTTLS` | `1` | `0` で STARTTLS を無効化（ローカルテスト用） |
+
+実運用に切り替えるには、GitHub の
+**Settings → Secrets and variables → Actions** で
+
+- **Variables** に `REPORT_TO`（実際の宛先）、必要なら `REPORT_FROM`
+- **Secrets** に `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD`
+
+を登録します。`SMTP_HOST` を登録するまではワークフローはドライランのまま
+動作し、生成されたメールは実行成果物（Artifacts）として確認できます。
+
+### 5.4 GitHub Actions による自動実行
+
+`.github/workflows/daily-signal.yml` が `cron: "30 22 * * 1-5"`（UTC）で
+毎営業日実行します。
+
+```
+22:30 UTC = 18:30 ET (EST) / 17:30 ET (EDT)  … 米国クローズの1.5〜2.5時間後
+          = 07:30 JST（翌日）                 … 日本オープンの1.5時間前
+```
+
+論文のタイミング規約（時点 t の米国クローズ → 翌営業日 t+1 の日本
+Open-to-Close）に沿った時間帯です。
+
+- **スケジュール実行**では `--require-live --skip-if-stale 0` が付きます。
+  合成データを実シグナルとしてメールしないための安全策であり、また
+  米国休場などで日米双方が取引していない日には「新しい米国ショックが
+  存在しない」ため、前日の建玉を再送せず正常終了します。
+- **手動実行**（Actions タブ → Run workflow）では `date` / `dry_run` /
+  `offline` を指定でき、ネットワークなしでパイプライン全体を試せます。
+- 生成物は常に Artifacts（`daily-signal-<run_id>`、保持30日）へアップロード
+  されるため、送信の成否にかかわらず内容を確認できます。
+
+**課金枠について**: GitHub Actions のスケジュール実行は、パブリック
+リポジトリでは無料、プライベートリポジトリでも Free プランの月2,000分の
+無料枠内で動作します（本ジョブは1回あたり数分）。
+
+**既知の注意点**:
+
+- GitHub の cron はベストエフォートで、混雑時は数分〜1時間程度遅延します。
+  上記の時間帯には十分な余裕を取ってあります。
+- **リポジトリが60日間非アクティブだとスケジュールが自動停止**します。
+  Actions タブから再有効化するか、コミットを push してください。
+
+---
+
+## 6. 検証結果（合成データ）
 
 `verify_logic.py` の実行例（seed=0）:
 
@@ -304,7 +410,7 @@ DOUBLE     47.27 14.27  3.31  -7.11
 
 ---
 
-## 6. 開発情報・実装メモ
+## 7. 開発情報・実装メモ
 
 - **設計方針**: `common.py` が論文の式番号と1対1に対応する純粋関数群を提供し、
   検証スクリプトとリアルタイムスクリプトはこれを呼び出すだけにしている。
@@ -329,7 +435,14 @@ DOUBLE     47.27 14.27  3.31  -7.11
 - **年率化**: 既定 252（日次）。論文の月次想定に合わせる場合は
   `performance_metrics(..., periods_per_year=12)`。
 - **再現性**: `verify_logic.py` は `--seed` で固定可能。`realtime_run.py` の
-  合成フォールバックは実行時刻ベースのシードを使う。
+  合成フォールバックは実行時刻ベースのシードを使い、系列は当日まで生成される
+  （ライブデータと同じ日付レンジ・形状を持たせるため）。
+- **メール配信**: `daily_report.py` は `realtime_run.py` の
+  `get_data` / `build_prior` / `snapshot_at` をそのまま再利用するため、
+  シグナルの計算経路は手動実行時と完全に同一。メール固有の処理（描画・
+  MIME組み立て・SMTP）だけを追加している。合成フォールバック時は件名と
+  本文の双方に `SYNTHETIC` 警告が入り、CI のスケジュール実行では
+  `--require-live` により、そもそも合成データでの送信が起きない。
 
 ### 既知の制約
 
@@ -341,7 +454,7 @@ DOUBLE     47.27 14.27  3.31  -7.11
 
 ---
 
-## 7. 参考
+## 8. 参考
 
 中川慧・竹本悠城・久保健治・加藤真大,
 "Lead-lag strategies for Japanese and U.S. sectors using subspace regularization PCA",

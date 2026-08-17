@@ -1,7 +1,8 @@
 name: Daily lead-lag signal
 
 # Runs the subspace-regularized PCA lead-lag model once per trading day and
-# e-mails the resulting long/short book.
+# delivers the resulting long/short book by e-mail and/or Discord (see
+# REPORT_CHANNELS below).
 #
 # Timing follows the paper's convention: the U.S. close-to-close return on
 # day t predicts the Japanese open-to-close return on day t+1, so the job
@@ -36,6 +37,10 @@ on:
         required: false
         type: boolean
         default: false
+      channels:
+        description: "Delivery channels, comma-separated (email, discord). Empty = repo default (REPORT_CHANNELS variable, or 'email')."
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -70,10 +75,12 @@ jobs:
           IN_DATE: ${{ inputs.date }}
           IN_DRY: ${{ inputs.dry_run }}
           IN_OFFLINE: ${{ inputs.offline }}
+          IN_CHANNELS: ${{ inputs.channels }}
         run: |
           flags=""
           if [ -n "$IN_DATE" ]; then flags="$flags --date $IN_DATE"; fi
           if [ "$IN_DRY" = "true" ]; then flags="$flags --dry-run"; fi
+          if [ -n "$IN_CHANNELS" ]; then flags="$flags --channels $IN_CHANNELS"; fi
           if [ "$IN_OFFLINE" = "true" ]; then
             # Manual pipeline test on synthetic data: no freshness check,
             # since simulated prices are never "today's market".
@@ -92,9 +99,13 @@ jobs:
 
       - name: Generate and send the daily signal
         env:
-          # Configure these as repository secrets to enable real delivery.
-          # With SMTP_HOST unset the script falls back to a dry run and the
-          # rendered message is uploaded as a build artifact instead.
+          # Which channels to use when --channels wasn't passed above.
+          # Comma-separated: "email", "discord", or "email,discord".
+          # Unset -> the script defaults to "email".
+          REPORT_CHANNELS: ${{ vars.REPORT_CHANNELS }}
+          # Configure these as repository secrets to enable real e-mail
+          # delivery. With SMTP_HOST unset the script falls back to a dry
+          # run and the rendered message is uploaded as a build artifact.
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -104,6 +115,10 @@ jobs:
           # variables (Settings -> Secrets and variables -> Actions -> Variables).
           REPORT_FROM: ${{ vars.REPORT_FROM }}
           REPORT_TO: ${{ vars.REPORT_TO }}
+          # Discord webhook URL for the target channel (Secrets, since the
+          # URL itself is a bearer credential -- see README section 5.5).
+          # With this unset the script falls back to a dry run.
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: uv run python daily_report.py ${{ steps.flags.outputs.flags }}
 
       - name: Upload rendered report

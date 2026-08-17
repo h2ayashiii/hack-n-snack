@@ -2,13 +2,22 @@
 daily_report.py
 ===============
 Daily driver for the subspace-regularized PCA lead-lag model: build the
-signal for the latest U.S. close, render it as an e-mail, and send it.
+signal for the latest U.S. close, render it, and deliver it.
 
 Designed to be run once per day from CI (see
 ``.github/workflows/daily-signal.yml``) after the U.S. close and before
 the Japanese open, which is exactly the window the paper's timing
 convention targets: the U.S. close-to-close return on day *t* predicts
 the Japanese open-to-close return on day *t+1*.
+
+Two delivery channels are supported, selected independently of each
+other and of the underlying signal computation:
+
+    --channels email            (default) e-mail only
+    --channels discord          Discord webhook only
+    --channels email,discord    both
+
+    REPORT_CHANNELS   env var equivalent of --channels (CLI wins)
 
 E-mail configuration is read from the environment so that CI can supply
 it through secrets:
@@ -26,13 +35,27 @@ documentation, so an unconfigured deployment can never deliver mail to a
 real mailbox.  With no SMTP_HOST the script falls back to a dry run and
 writes the rendered message to the output directory instead of sending.
 
+Discord configuration:
+
+    DISCORD_WEBHOOK_URL   the target channel's webhook URL (unset -> dry run)
+
+With no DISCORD_WEBHOOK_URL the script falls back to writing the embed
+payload as JSON instead of posting it, exactly like the e-mail path.
+
 Run
 ---
     # Render only -- writes output/daily_report_YYYY-MM-DD.{eml,html}
+    # and/or output/discord_payload_YYYY-MM-DD.json depending on --channels
     python daily_report.py --dry-run
 
-    # Render and send (needs SMTP_HOST etc. in the environment)
+    # Render and send by e-mail (needs SMTP_HOST etc. in the environment)
     python daily_report.py
+
+    # Post to Discord instead (needs DISCORD_WEBHOOK_URL in the environment)
+    python daily_report.py --channels discord
+
+    # Both channels at once
+    python daily_report.py --channels email,discord
 
     # Backfill / test a specific signal date, no network
     python daily_report.py --date 2024-11-01 --offline --dry-run
@@ -42,9 +65,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import smtplib
 import sys
+import urllib.error
+import urllib.request
+import uuid
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
@@ -58,6 +85,8 @@ MOCK_ADDRESS = "lead-lag-signals@example.com"
 MOCK_SENDER = "lead-lag-bot@example.com"
 
 FACTOR_NAMES = ["global", "US-Japan spread", "cyclical-defensive"]
+
+VALID_CHANNELS = {"email", "discord"}
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +403,171 @@ def write_dry_run(msg, s, out_dir):
 
 
 # ---------------------------------------------------------------------------
+# Discord delivery
+# ---------------------------------------------------------------------------
+DISCORD_COLOR_LIVE = 0x2F6FEB       # blue -- live data
+DISCORD_COLOR_SYNTHETIC = 0xF0A020  # amber -- synthetic fallback warning
+
+
+def _discord_side_field(indices, s):
+    if not indices:
+        return "—"
+    lines = []
+    for i in indices:
+        tk, lbl, z, w = _row(i, s)
+        lines.append(f"`{tk:<8s}` {lbl}  `{z:+.3f}`")
+    return "\n".join(lines)
+
+
+def build_discord_payload(s, perf=None, attach_chart=False) -> dict:
+    """Build a Discord webhook payload (a single embed) for the snapshot.
+
+    Kept shorter than the e-mail on purpose: Discord embed fields cap at
+    1024 characters and 25 fields, so this shows the tradeable book
+    (top-q / bottom-q) rather than the full 17-sector ranking -- the
+    attached chart covers the rest visually.
+    """
+    longs, shorts = _book(s)
+    date = pd.Timestamp(s["signal_date"]).date()
+    live = s["live"]
+
+    factor_lines = []
+    for k in range(s["K"]):
+        nm = FACTOR_NAMES[k] if k < len(FACTOR_NAMES) else f"factor {k+1}"
+        factor_lines.append(f"f_{k+1} ({nm}): `{s['f'][k]:+.3f}`")
+
+    fields = [
+        {"name": f"\U0001F7E2 LONG ({len(longs)})",
+         "value": _discord_side_field(longs, s), "inline": True},
+        {"name": f"\U0001F534 SHORT ({len(shorts)})",
+         "value": _discord_side_field(shorts, s), "inline": True},
+        {"name": "Common-factor scores (eq. 18)",
+         "value": "\n".join(factor_lines) or "—", "inline": False},
+    ]
+
+    if perf:
+        fields.append({
+            "name": f"Realised PCA_SUB performance (last {perf['n']} sessions)",
+            "value": (f"cumulative `{100 * perf['cumulative']:+.2f}%`  "
+                      f"mean `{100 * perf['mean']:+.3f}%`  "
+                      f"hit rate `{100 * perf['hit_rate']:.1f}%`"),
+            "inline": False,
+        })
+
+    us_used = s.get("us_used", C.US_TICKERS)
+    universe_note = ""
+    if len(us_used) < len(C.US_TICKERS):
+        missing = ", ".join(sorted(set(C.US_TICKERS) - set(us_used)))
+        universe_note = (f"\nU.S. universe: {len(us_used)}/{len(C.US_TICKERS)} "
+                         f"(no data yet for {missing})")
+
+    description = (
+        f"U.S. close-to-close on **{date}** → predicted Japanese "
+        f"open-to-close for the **next JP session**.\n"
+        f"Model: PCA_SUB, L={s['L']}, λ={s['lam']}, K={s['K']}, "
+        f"q={s['q']}\n"
+        f"Data source: {s['source']}{universe_note}"
+    )
+    if not live:
+        description = ("⚠️ **SYNTHETIC fallback data — do not "
+                       "trade on this.**\n\n" + description)
+
+    embed = {
+        "title": f"Lead-lag signal — {date}",
+        "description": description,
+        "color": DISCORD_COLOR_LIVE if live else DISCORD_COLOR_SYNTHETIC,
+        "fields": fields,
+        "footer": {"text": "Research output only -- not investment advice. "
+                           "Costs/slippage not modelled."},
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    if attach_chart:
+        embed["image"] = {"url": "attachment://signal.png"}
+
+    return {"username": "Lead-Lag PCA Bot", "embeds": [embed]}
+
+
+def _encode_multipart(payload: dict, chart_path: str | None):
+    """Minimal multipart/form-data encoder (stdlib only, no ``requests``).
+
+    Discord's webhook endpoint expects the JSON payload under a
+    ``payload_json`` part and, when an image is attached, the file under
+    ``files[0]`` with the embed referencing it via ``attachment://name``.
+    """
+    boundary = f"leadlag-{uuid.uuid4().hex}"
+    nl = "\r\n"
+    chunks = [
+        (f"--{boundary}{nl}"
+         f'Content-Disposition: form-data; name="payload_json"{nl}'
+         f"Content-Type: application/json{nl}{nl}"
+         f"{json.dumps(payload)}{nl}").encode("utf-8")
+    ]
+    if chart_path and os.path.exists(chart_path):
+        with open(chart_path, "rb") as fh:
+            img = fh.read()
+        chunks.append(
+            (f"--{boundary}{nl}"
+             f'Content-Disposition: form-data; name="files[0]"; '
+             f'filename="signal.png"{nl}'
+             f"Content-Type: image/png{nl}{nl}").encode("utf-8")
+            + img + nl.encode("utf-8")
+        )
+    chunks.append(f"--{boundary}--{nl}".encode("utf-8"))
+    return f"multipart/form-data; boundary={boundary}", b"".join(chunks)
+
+
+def post_discord(webhook_url: str, payload: dict, chart_path=None, timeout=30):
+    """POST the embed (with the chart attached) to a Discord webhook.
+
+    Raises on failure so CI surfaces the problem, matching send_message().
+    ``?wait=true`` makes Discord return the created message (or a detailed
+    error body) instead of a bare 204, which is worth the extra latency
+    for a once-a-day job.
+    """
+    content_type, body = _encode_multipart(payload, chart_path)
+    sep = "&" if "?" in webhook_url else "?"
+    req = urllib.request.Request(f"{webhook_url}{sep}wait=true", data=body,
+                                 method="POST")
+    req.add_header("Content-Type", content_type)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        raise RuntimeError(
+            f"Discord webhook POST failed ({e.code}): {detail}") from e
+
+
+def write_discord_dry_run(payload: dict, s, out_dir):
+    """Persist the rendered payload so CI can upload it as an artifact."""
+    stamp = pd.Timestamp(s["signal_date"]).date()
+    path = os.path.join(out_dir, f"discord_payload_{stamp}.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    return path
+
+
+def _mask_webhook(url: str) -> str:
+    """Never print the webhook token in full -- it's a bearer credential
+    that lets anyone post to the channel."""
+    tail = url.rsplit("/", 1)[-1]
+    return url[: len(url) - len(tail)] + tail[:6] + "…(redacted)"
+
+
+def resolve_channels(args) -> list[str]:
+    """Delivery channels from --channels, falling back to $REPORT_CHANNELS
+    and then to e-mail-only, so existing deployments keep working
+    unchanged."""
+    raw = args.channels or os.environ.get("REPORT_CHANNELS", "").strip() or "email"
+    channels = [c.strip().lower() for c in raw.split(",") if c.strip()]
+    invalid = [c for c in channels if c not in VALID_CHANNELS]
+    if invalid:
+        raise SystemExit(f"unknown channel(s): {', '.join(invalid)} "
+                         f"(valid: {', '.join(sorted(VALID_CHANNELS))})")
+    return channels or ["email"]
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -381,13 +575,20 @@ def main():
         description="Daily lead-lag signal e-mail report")
     ap.add_argument("--date", default=None,
                     help="signal date (YYYY-MM-DD); default: latest available")
+    ap.add_argument("--channels", default=None,
+                    help="comma-separated delivery channels: email,discord "
+                         "(default: $REPORT_CHANNELS or 'email')")
     ap.add_argument("--to", default=None,
                     help=f"comma-separated recipients (default: $REPORT_TO or "
                          f"the mock address {MOCK_ADDRESS})")
     ap.add_argument("--sender", "--from", dest="sender", default=None,
                     help=f"From address (default: $REPORT_FROM or {MOCK_SENDER})")
+    ap.add_argument("--discord-webhook", default=None,
+                    help="Discord webhook URL "
+                         "(default: $DISCORD_WEBHOOK_URL)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="render only; never open an SMTP connection")
+                    help="render only; never open an SMTP connection or "
+                         "post to Discord")
     ap.add_argument("--require-live", action="store_true",
                     help="exit non-zero instead of falling back to synthetic "
                          "data (use in production so no simulated book is "
@@ -471,24 +672,46 @@ def main():
         save_chart_single(s, chart_path)
 
     # --- deliver ----------------------------------------------------------
-    cfg = smtp_config(args)
-    msg = build_message(s, cfg["sender"], cfg["recipients"], perf, chart_path)
+    channels = resolve_channels(args)
 
-    dry = args.dry_run or not cfg["host"]
-    if dry and not args.dry_run:
-        print("[info] SMTP_HOST is not set -- falling back to a dry run.")
+    if "email" in channels:
+        cfg = smtp_config(args)
+        msg = build_message(s, cfg["sender"], cfg["recipients"], perf, chart_path)
 
-    if dry:
-        eml, html = write_dry_run(msg, s, out_dir)
-        print(f"[dry-run] would send to: {', '.join(cfg['recipients'])}")
-        print(f"[dry-run] subject: {msg['Subject']}")
-        print(f"[dry-run] message written to {eml}")
-        print(f"[dry-run] html preview written to {html}")
-    else:
-        send_message(msg, cfg)
-        print(f"[sent] {msg['Subject']}")
-        print(f"[sent] to {', '.join(cfg['recipients'])} via "
-              f"{cfg['host']}:{cfg['port']}")
+        dry = args.dry_run or not cfg["host"]
+        if dry and not args.dry_run:
+            print("[info] SMTP_HOST is not set -- falling back to a dry run.")
+
+        if dry:
+            eml, html = write_dry_run(msg, s, out_dir)
+            print(f"[dry-run] email would send to: {', '.join(cfg['recipients'])}")
+            print(f"[dry-run] email subject: {msg['Subject']}")
+            print(f"[dry-run] message written to {eml}")
+            print(f"[dry-run] html preview written to {html}")
+        else:
+            send_message(msg, cfg)
+            print(f"[sent] email: {msg['Subject']}")
+            print(f"[sent] email to {', '.join(cfg['recipients'])} via "
+                  f"{cfg['host']}:{cfg['port']}")
+
+    if "discord" in channels:
+        webhook = (args.discord_webhook
+                  or os.environ.get("DISCORD_WEBHOOK_URL", "").strip())
+        payload = build_discord_payload(s, perf, attach_chart=bool(chart_path))
+
+        dry = args.dry_run or not webhook
+        if dry and not args.dry_run:
+            print("[info] DISCORD_WEBHOOK_URL is not set -- falling back "
+                  "to a dry run.")
+
+        if dry:
+            path = write_discord_dry_run(payload, s, out_dir)
+            print(f"[dry-run] discord payload written to {path}")
+        else:
+            post_discord(webhook, payload, chart_path)
+            print(f"[sent] discord: {payload['embeds'][0]['title']} "
+                  f"-> {_mask_webhook(webhook)}")
+
     return 0
 
 

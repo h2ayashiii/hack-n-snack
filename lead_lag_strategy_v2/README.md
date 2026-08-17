@@ -169,7 +169,7 @@ MDD -9.58% と、リスク調整後リターンと最大ドローダウンの両
 | `common.py` | 共通ロジック（リターン変換・標準化・C0構成・正則化PCA・シグナル・ポートフォリオ・指標・バックテストループ） |
 | `verify_logic.py` | **ロジック検証**: 理想化モデルから合成データを生成し、命題1–2と表2の結論を再現。多面的な図を `output/verify_logic.png` に出力 |
 | `realtime_run.py` | **リアルタイム実行**: 最新データ（yfinance、失敗時は合成）から現時点の因子構造・シグナル・翌日のロング/ショート建玉を出力。チャートを `output/` に保存 |
-| `daily_report.py` | **日次レポート**: シグナルをHTML/テキストのメールとして生成し SMTP で送信（第5節） |
+| `daily_report.py` | **日次レポート**: シグナルをメール（HTML/テキスト、SMTP）と Discord（Embed、Webhook）のどちらか／両方で配信（第5節） |
 | `../.github/workflows/daily-signal.yml` | **日次自動実行**: GitHub Actions の cron で毎営業日 `daily_report.py` を実行 |
 | `output/` | 生成されるチャート・図の出力先（git 管理外） |
 | `README.md` | 本ファイル |
@@ -281,52 +281,67 @@ python realtime_run.py --output-dir /tmp/charts # 出力先ディレクトリを
 
 ---
 
-## 5. 日次自動実行とメール送信
+## 5. 日次自動実行と通知配信（メール／Discord）
 
 毎営業日、米国クローズ後・日本オープン前にシグナルを生成し、その内容を
-メールで配信する仕組みです。`daily_report.py`（生成と送信）と
-`.github/workflows/daily-signal.yml`（GitHub Actions の定期実行）の2つで
-構成されます。
+**メールと Discord のどちらか、または両方**で配信する仕組みです。
+`daily_report.py`（生成と配信）と `.github/workflows/daily-signal.yml`
+（GitHub Actions の定期実行）の2つで構成されます。
 
-### 5.1 メールの内容
+シグナルの計算は配信チャネルに関係なく1回だけ行われ（`realtime_run.py`
+と同じ経路）、その結果を各チャネル向けに描画してから送るだけです。
 
-| セクション | 内容 |
+### 5.1 配信内容
+
+| チャネル | 内容 |
 |---|---|
-| ヘッダ | シグナル日 t、予測対象（翌JPセッション）、パラメータ、データソース |
-| Book | 翌セッションのロング5銘柄／ショート5銘柄と `zhat`・ウェイト |
-| 共通因子スコア | `f_t`（global / US-Japan spread / cyclical-defensive、式18） |
-| 実現パフォーマンス | 直近20営業日の PCA_SUB 実現リターン（累積・平均・勝率） |
-| チャート | 予測リターンの横棒グラフ（インライン画像として添付） |
-| 全ランキング | 日本17業種の `zhat_{J,t+1}` 降順 |
+| メール | シグナル日・パラメータ・データソース、翌セッションのロング/ショート全銘柄と `zhat`・ウェイト、共通因子スコア `f_t`（式18）、直近20営業日の実現パフォーマンス、チャート（インライン画像）、日本17業種の全ランキング。HTML とプレーンテキストの `multipart/alternative` |
+| Discord | 同じシグナルの要約を1つの Embed として投稿。上位/下位 `q`（既定 top-5/bottom-5）の LONG/SHORT、共通因子スコア、実現パフォーマンス、チャート画像を添付。Discord の Embed 制限（フィールド1024文字・25個まで）に収まるよう、日本17業種の全ランキングは省略（メールまたは Artifacts 参照） |
 
-HTML とプレーンテキストの `multipart/alternative` で送信するため、
-HTML 非対応のクライアントでも読めます。
+どちらも合成データにフォールバックした場合は警告（メール: 件名と本文、
+Discord: Embed 冒頭と色をオレンジに変更）が入ります。
 
-### 5.2 手動実行
+### 5.2 配信チャネルの選択
 
 ```bash
-# 生成のみ（SMTP に接続しない）→ output/daily_report_YYYY-MM-DD.{eml,html}
+python daily_report.py                          # 既定: メールのみ
+python daily_report.py --channels discord        # Discord のみ
+python daily_report.py --channels email,discord  # 両方
+```
+
+環境変数 `REPORT_CHANNELS`（例: `email,discord`）でも指定でき、
+`--channels` が優先されます。両方とも未指定の場合は `email` のみ
+（後方互換）。
+
+### 5.3 手動実行
+
+```bash
+# 生成のみ（SMTP/Discordに接続しない）
+# → output/daily_report_YYYY-MM-DD.{eml,html} と/または
+#   output/discord_payload_YYYY-MM-DD.json
 python daily_report.py --dry-run
 
 # 特定日を指定してバックフィル／テスト（ネットワーク不要）
-python daily_report.py --date 2024-11-01 --offline --dry-run
+python daily_report.py --date 2024-11-01 --offline --dry-run --channels discord
 
-# 実際に送信（環境変数の設定が必要、5.3参照）
-python daily_report.py
+# 実際に配信（環境変数の設定が必要、5.4/5.5参照）
+python daily_report.py --channels email,discord
 ```
 
 主なオプション:
 
 | オプション | 意味 |
 |---|---|
-| `--dry-run` | SMTP に接続せず `.eml` と `.html` をファイル出力 |
+| `--channels` | 配信チャネル（`email` / `discord` / `email,discord`、既定 `email`） |
+| `--dry-run` | SMTP/Discord に接続せず、選択したチャネルの内容をファイル出力 |
 | `--require-live` | ライブ価格が取れない場合に合成データへフォールバックせず異常終了 |
-| `--skip-if-stale N` | 最新シグナル日が N 日より古ければ何も送らず正常終了（`--date` 指定時は無視） |
+| `--skip-if-stale N` | 最新シグナル日が N 日より古ければ何も配信せず正常終了（`--date` 指定時は無視） |
 | `--trailing-days N` | 実現パフォーマンス集計期間（既定20、`0` で無効） |
-| `--to` / `--from` | 宛先・差出人（環境変数より優先） |
-| `--no-chart` | チャートの生成と添付を省略 |
+| `--to` / `--from` | メール宛先・差出人（環境変数より優先） |
+| `--discord-webhook` | Discord Webhook URL（環境変数より優先） |
+| `--no-chart` | チャートの生成と添付を省略（両チャネル共通） |
 
-### 5.3 メールアドレスと SMTP の設定
+### 5.4 メールアドレスと SMTP の設定
 
 **既定値はモック**です。`example.com` は RFC 2606 が文書用に予約している
 ドメインなので、未設定のまま実行しても実在のメールボックスには決して
@@ -350,7 +365,52 @@ python daily_report.py
 を登録します。`SMTP_HOST` を登録するまではワークフローはドライランのまま
 動作し、生成されたメールは実行成果物（Artifacts）として確認できます。
 
-### 5.4 GitHub Actions による自動実行
+### 5.5 Discord Webhook の設定
+
+Discord への投稿は **Webhook URL** だけで完結し、Bot の作成やサーバーへの
+招待は不要です。
+
+**① 投稿先チャンネルに Webhook を作成する**
+
+1. Discord サーバーで、投稿したいテキストチャンネルの設定（歯車アイコン）
+   を開く
+2. 左メニューの **連携サービス（Integrations）** → **ウェブフック
+   （Webhooks）** → **新しいウェブフック（New Webhook）**
+3. 名前・アイコンを好みで設定（メッセージ送信者名は `daily_report.py`
+   が `username: "Lead-Lag PCA Bot"` で上書きするため、ここでの名前は
+   実質的に使われません）
+4. **ウェブフック URL をコピー（Copy Webhook URL）** をクリックし、
+   `https://discord.com/api/webhooks/<id>/<token>` 形式の URL を控える
+
+> **この URL 自体が認証情報です。** URL を知っていれば誰でもそのチャンネルに
+> 投稿できてしまうため、コードにハードコードしたり公開リポジトリにコミット
+> したりせず、必ず Secrets 経由で渡してください。漏洩した場合は Discord の
+> Webhook 設定画面から再生成（Regenerate）すれば無効化できます。
+
+**② 環境変数を設定する**
+
+| 環境変数 | 既定値 | 用途 |
+|---|---|---|
+| `DISCORD_WEBHOOK_URL` | （未設定） | **未設定ならドライラン**（`output/discord_payload_*.json` に出力）にフォールバック |
+
+ローカルで試す場合:
+
+```bash
+export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/xxxx/yyyy"
+python daily_report.py --offline --channels discord   # 合成データで投稿テスト
+```
+
+実運用に切り替えるには、GitHub の
+**Settings → Secrets and variables → Actions → Secrets** に
+`DISCORD_WEBHOOK_URL` を登録し、**Variables** の `REPORT_CHANNELS` に
+`discord`（またはメールと併用するなら `email,discord`）を設定します。
+
+**技術的な補足**: Discord Webhook API へ `multipart/form-data` で
+POST し、JSON の Embed（`payload_json`）とチャート画像（`files[0]`）を
+1リクエストで送っています。追加の依存パッケージ（`requests` など）は
+使わず、標準ライブラリの `urllib` のみで実装しています。
+
+### 5.6 GitHub Actions による自動実行
 
 `.github/workflows/daily-signal.yml` が `cron: "30 22 * * 1-5"`（UTC）で
 毎営業日実行します。
@@ -364,17 +424,21 @@ python daily_report.py
 Open-to-Close）に沿った時間帯です。
 
 - **スケジュール実行**では `--require-live --skip-if-stale 0` が付きます。
-  合成データを実シグナルとしてメールしないための安全策であり、また
+  合成データを実シグナルとして配信しないための安全策であり、また
   米国休場などで日米双方が取引していない日には「新しい米国ショックが
-  存在しない」ため、前日の建玉を再送せず正常終了します。
+  存在しない」ため、前日の建玉を再送せず正常終了します。使用する
+  チャネルは Variables の `REPORT_CHANNELS`（未設定なら `email` のみ）
+  に従います。
 - **手動実行**（Actions タブ → Run workflow）では `date` / `dry_run` /
-  `offline` を指定でき、ネットワークなしでパイプライン全体を試せます。
+  `offline` / `channels` を指定でき、ネットワークなしでパイプライン
+  全体を試せます（例: `channels=discord` で Discord 投稿だけテスト）。
 - 生成物は常に Artifacts（`daily-signal-<run_id>`、保持30日）へアップロード
-  されるため、送信の成否にかかわらず内容を確認できます。
+  されるため、配信の成否にかかわらず内容を確認できます。
 
 **課金枠について**: GitHub Actions のスケジュール実行は、パブリック
 リポジトリでは無料、プライベートリポジトリでも Free プランの月2,000分の
-無料枠内で動作します（本ジョブは1回あたり数分）。
+無料枠内で動作します（本ジョブは1回あたり数分）。Discord Webhook の
+利用自体にも料金は発生しません。
 
 **既知の注意点**:
 
@@ -437,12 +501,16 @@ DOUBLE     47.27 14.27  3.31  -7.11
 - **再現性**: `verify_logic.py` は `--seed` で固定可能。`realtime_run.py` の
   合成フォールバックは実行時刻ベースのシードを使い、系列は当日まで生成される
   （ライブデータと同じ日付レンジ・形状を持たせるため）。
-- **メール配信**: `daily_report.py` は `realtime_run.py` の
+- **通知配信**: `daily_report.py` は `realtime_run.py` の
   `get_data` / `build_prior` / `snapshot_at` をそのまま再利用するため、
-  シグナルの計算経路は手動実行時と完全に同一。メール固有の処理（描画・
-  MIME組み立て・SMTP）だけを追加している。合成フォールバック時は件名と
-  本文の双方に `SYNTHETIC` 警告が入り、CI のスケジュール実行では
-  `--require-live` により、そもそも合成データでの送信が起きない。
+  シグナルの計算経路は手動実行時と完全に同一。メール（描画・MIME組み立て
+  ・SMTP）と Discord（Embed組み立て・`multipart/form-data` POST、`urllib`
+  のみで実装し追加依存なし）は互いに独立したチャネルとして後段に追加して
+  おり、`--channels` で選択する。合成フォールバック時はどちらのチャネル
+  にも `SYNTHETIC` 警告が入り、CI のスケジュール実行では `--require-live`
+  により、そもそも合成データでの配信が起きない。Discord の Webhook URL
+  はそれ自体が認証情報のため、ログには常にマスクした値のみ出力する
+  （`_mask_webhook`）。
 
 ### 既知の制約
 

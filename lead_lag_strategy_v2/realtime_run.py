@@ -69,7 +69,7 @@ def ensure_output_dir(path: str) -> str:
 # ---------------------------------------------------------------------------
 # Data acquisition
 # ---------------------------------------------------------------------------
-def fetch_prices(prior_start="2010-01-01"):
+def fetch_prices(prior_start="2010-01-01", retries=3, retry_delay=5):
     """Download open/close prices via yfinance from prior_start to today.
 
     Following Section 4.1 of the paper, only days on which *both* markets
@@ -77,31 +77,75 @@ def fetch_prices(prior_start="2010-01-01"):
     market's ETFs has a fresh quote).  Late-inception tickers (XLRE
     2015-10, XLC 2018-06) keep NaN before their first quote instead of
     truncating the early history that the 2010-2014 prior window needs.
+
+    ``threads=False`` forces yfinance to fetch tickers one at a time.
+    With the default threaded mode, concurrent worker threads all hit
+    yfinance's own timezone-lookup cache (a single sqlite file under
+    ``~/.cache/py-yfinance/``) at once; under load that occasionally
+    raises ``sqlite3.OperationalError: database is locked`` for one or
+    two tickers, which then silently shows up downstream as missing data
+    for that ticker rather than as a raised exception here. Serial
+    fetching removes the concurrent writes that trigger it.
+
+    The whole download is retried (with backoff) if it raises, or if the
+    most recent rows are incomplete for any currently-listed ticker --
+    which catches exactly that "yfinance dropped one ticker without
+    raising" failure mode -- since a fresh attempt reliably succeeds once
+    the original contention has passed.
     """
     import yfinance as yf
 
     tickers = C.US_TICKERS + C.JP_TICKERS
     end = dt.date.today() + dt.timedelta(days=1)
-    raw = yf.download(tickers, start=prior_start, end=end.isoformat(),
-                      auto_adjust=True, progress=False, group_by="column")
-    if raw is None or len(raw) == 0:
-        raise RuntimeError("yfinance returned no data")
 
-    open_ = raw["Open"][tickers]
-    close = raw["Close"][tickers]
+    last_err = None
+    delay = retry_delay
+    for attempt in range(1, retries + 1):
+        try:
+            raw = yf.download(tickers, start=prior_start, end=end.isoformat(),
+                              auto_adjust=True, progress=False,
+                              group_by="column", threads=False)
+            if raw is None or len(raw) == 0:
+                raise RuntimeError("yfinance returned no data")
 
-    us_live = close[C.US_TICKERS].notna().sum(axis=1) > len(C.US_TICKERS) // 2
-    jp_live = close[C.JP_TICKERS].notna().sum(axis=1) > len(C.JP_TICKERS) // 2
-    common_days = us_live & jp_live
-    open_ = open_.loc[common_days]
-    close = close.loc[common_days]
+            open_ = raw["Open"][tickers]
+            close = raw["Close"][tickers]
 
-    # patch isolated per-ticker gaps only; pre-inception NaN stays NaN
-    close = close.ffill(limit=2)
-    open_ = open_.ffill(limit=2)
-    if len(close) < 120:
-        raise RuntimeError(f"insufficient history ({len(close)} rows)")
-    return open_, close
+            us_live = close[C.US_TICKERS].notna().sum(axis=1) > len(C.US_TICKERS) // 2
+            jp_live = close[C.JP_TICKERS].notna().sum(axis=1) > len(C.JP_TICKERS) // 2
+            common_days = us_live & jp_live
+            open_ = open_.loc[common_days]
+            close = close.loc[common_days]
+
+            # patch isolated per-ticker gaps only; pre-inception NaN stays NaN
+            close = close.ffill(limit=2)
+            open_ = open_.ffill(limit=2)
+            if len(close) < 120:
+                raise RuntimeError(f"insufficient history ({len(close)} rows)")
+
+            # By now every ticker should be listed, so the trailing window
+            # (the one the signal actually needs) must be fully populated;
+            # a gap here means yfinance dropped a ticker's quotes without
+            # raising.
+            recent = close.tail(65)
+            gaps = list(recent.columns[recent.isna().any()])
+            if gaps:
+                raise RuntimeError(
+                    f"incomplete recent data for {gaps} "
+                    f"(likely a transient yfinance fetch failure)")
+
+            return open_, close
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                print(f"[warn] yfinance fetch attempt {attempt}/{retries} "
+                      f"failed ({type(e).__name__}: {e}); retrying in "
+                      f"{delay}s.", file=sys.stderr)
+                time.sleep(delay)
+                delay *= 2
+
+    raise RuntimeError(
+        f"yfinance fetch failed after {retries} attempts") from last_err
 
 
 def synthetic_window(seed=None, start_date="2010-01-01"):

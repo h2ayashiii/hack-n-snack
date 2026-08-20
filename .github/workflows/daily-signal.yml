@@ -38,7 +38,7 @@ on:
         type: boolean
         default: false
       channels:
-        description: "Delivery channels, comma-separated (email, discord). Empty = repo default (REPORT_CHANNELS variable, or 'email')."
+        description: "Delivery channels, comma-separated (email, discord). Empty = repo default (REPORT_CHANNELS variable, or 'discord' for this workflow)."
         required: false
         type: string
 
@@ -101,8 +101,13 @@ jobs:
         env:
           # Which channels to use when --channels wasn't passed above.
           # Comma-separated: "email", "discord", or "email,discord".
-          # Unset -> the script defaults to "email".
-          REPORT_CHANNELS: ${{ vars.REPORT_CHANNELS }}
+          # This workflow is deployed for Discord: with the REPORT_CHANNELS
+          # repo variable unset, it defaults to "discord" here (note this
+          # differs from daily_report.py's own script-level default of
+          # "email" -- that default is for direct/manual invocation).
+          # Set the REPORT_CHANNELS variable to override, e.g. to add email
+          # back once SMTP_* secrets are configured.
+          REPORT_CHANNELS: ${{ vars.REPORT_CHANNELS || 'discord' }}
           # Configure these as repository secrets to enable real e-mail
           # delivery. With SMTP_HOST unset the script falls back to a dry
           # run and the rendered message is uploaded as a build artifact.

@@ -402,8 +402,12 @@ python daily_report.py --offline --channels discord   # 合成データで投稿
 
 実運用に切り替えるには、GitHub の
 **Settings → Secrets and variables → Actions → Secrets** に
-`DISCORD_WEBHOOK_URL` を登録し、**Variables** の `REPORT_CHANNELS` に
-`discord`（またはメールと併用するなら `email,discord`）を設定します。
+`DISCORD_WEBHOOK_URL` を登録するだけで、`.github/workflows/daily-signal.yml`
+は毎営業日 Discord へ投稿するようになります（5.6節参照。この
+ワークフローは `REPORT_CHANNELS` 未設定時のデフォルトを `discord` に
+していて、Secret 追加だけで有効化する運用にしています）。
+メールと併用したい場合のみ **Variables** の `REPORT_CHANNELS` に
+`email,discord` を設定してください。
 
 **技術的な補足**: Discord Webhook API へ `multipart/form-data` で
 POST し、JSON の Embed（`payload_json`）とチャート画像（`files[0]`）を
@@ -427,8 +431,10 @@ Open-to-Close）に沿った時間帯です。
   合成データを実シグナルとして配信しないための安全策であり、また
   米国休場などで日米双方が取引していない日には「新しい米国ショックが
   存在しない」ため、前日の建玉を再送せず正常終了します。使用する
-  チャネルは Variables の `REPORT_CHANNELS`（未設定なら `email` のみ）
-  に従います。
+  チャネルは Variables の `REPORT_CHANNELS` に従いますが、**このワーク
+  フローは未設定時のデフォルトを `discord` にしている**（`daily_report.py`
+  単体の既定 `email` とは異なる）ため、`DISCORD_WEBHOOK_URL` の Secret
+  さえ設定すれば追加設定なしで Discord 配信が有効になります。
 - **手動実行**（Actions タブ → Run workflow）では `date` / `dry_run` /
   `offline` / `channels` を指定でき、ネットワークなしでパイプライン
   全体を試せます（例: `channels=discord` で Discord 投稿だけテスト）。
@@ -496,6 +502,17 @@ DOUBLE     47.27 14.27  3.31  -7.11
   - シグナル計算日の推定ウィンドウにデータが揃わない米国銘柄（上場前の
     XLC など）は、その日の推定ユニバースから除外して結合PCAを実行する
     （出力に使用銘柄数を明示）。日本側17銘柄は常に必須。
+  - `fetch_prices` は `yf.download(..., threads=False)` で銘柄を逐次
+    取得する。yfinance は既定でスレッド並行取得を行うが、その際に
+    各スレッドが共通のタイムゾーンキャッシュ（`~/.cache/py-yfinance/`
+    配下の単一 sqlite ファイル）へ同時書き込みを試みることがあり、
+    `sqlite3.OperationalError: database is locked` が一部銘柄だけ
+    無言で失敗する形で表面化する（例外は上がらず、その銘柄のデータが
+    欠損するだけ）。直近の実行分もこれが原因で
+    `ValueError: Missing Japanese data` として失敗していた。逐次取得に
+    加え、取得後に直近ウィンドウ（`tail(65)`）の欠損チェックを行い、
+    欠損があれば例外を送出してリトライ（最大3回、指数バックオフ）する
+    ことで、この一過性の失敗を自己修復する。
 - **年率化**: 既定 252（日次）。論文の月次想定に合わせる場合は
   `performance_metrics(..., periods_per_year=12)`。
 - **再現性**: `verify_logic.py` は `--seed` で固定可能。`realtime_run.py` の

@@ -412,7 +412,10 @@ python daily_report.py --offline --channels discord   # 合成データで投稿
 **技術的な補足**: Discord Webhook API へ `multipart/form-data` で
 POST し、JSON の Embed（`payload_json`）とチャート画像（`files[0]`）を
 1リクエストで送っています。追加の依存パッケージ（`requests` など）は
-使わず、標準ライブラリの `urllib` のみで実装しています。
+使わず、標準ライブラリの `urllib` のみで実装しています。`discord.com`
+は Cloudflare 配下にあり、`urllib` の既定 User-Agent（`Python-urllib/x.y`）
+はボット判定されて `403 (Cloudflare error 1010)` で弾かれるため、
+`post_discord()` では明示的な User-Agent ヘッダーを付与しています。
 
 ### 5.6 GitHub Actions による自動実行
 

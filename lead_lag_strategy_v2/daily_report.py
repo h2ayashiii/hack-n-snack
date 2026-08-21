@@ -529,6 +529,15 @@ def post_discord(webhook_url: str, payload: dict, chart_path=None, timeout=30):
     req = urllib.request.Request(f"{webhook_url}{sep}wait=true", data=body,
                                  method="POST")
     req.add_header("Content-Type", content_type)
+    # discord.com sits behind Cloudflare, which blocks urllib's default
+    # "Python-urllib/x.y" User-Agent as a bot signature (HTTP 403,
+    # Cloudflare error 1010) before the request ever reaches Discord.
+    # A descriptive UA -- Discord's own convention for API clients --
+    # gets past that check.
+    req.add_header(
+        "User-Agent",
+        "lead-lag-strategy-v2-daily-report/1.0 "
+        "(+https://github.com/h2ayashiii/hack-n-snack)")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status

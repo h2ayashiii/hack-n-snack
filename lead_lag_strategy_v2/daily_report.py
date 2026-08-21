@@ -67,6 +67,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import smtplib
 import sys
 import urllib.error
@@ -516,6 +517,41 @@ def _encode_multipart(payload: dict, chart_path: str | None):
     return f"multipart/form-data; boundary={boundary}", b"".join(chunks)
 
 
+# https://discord.com/api/webhooks/<snowflake id>/<token>, tolerating the
+# ptb./canary. subdomains, the legacy discordapp.com domain, a trailing
+# slash, and an existing query string (which post_discord() extends).
+_WEBHOOK_URL_RE = re.compile(
+    r"^https://(?:ptb\.|canary\.)?discord(?:app)?\.com"
+    r"/api/webhooks/(?P<id>\d+)/(?P<token>[^/?\s]+)/?(?:\?.*)?$")
+
+
+def _validate_webhook_url(webhook_url: str) -> None:
+    """Reject an obviously-malformed URL before spending a network call.
+
+    ``404 Unknown Webhook`` from Discord itself just means "no webhook
+    with this id+token exists right now" -- could be a genuinely deleted
+    /regenerated webhook (nothing this script can fix), but it's the same
+    error you'd get from a URL mangled while pasting it into the GitHub
+    secret (stray newline/space, wrong domain, a truncated token). This
+    catches the second class with a specific, actionable message instead
+    of a bare 404.
+    """
+    if re.search(r"\s", webhook_url):
+        raise ValueError(
+            "DISCORD_WEBHOOK_URL contains whitespace/newline characters -- "
+            "it was likely mangled when pasted into the GitHub secret. "
+            "Re-copy the URL from Discord (channel settings -> "
+            "Integrations -> Webhooks -> Copy Webhook URL) and re-paste it "
+            "without a trailing newline.")
+    if not _WEBHOOK_URL_RE.match(webhook_url):
+        raise ValueError(
+            "DISCORD_WEBHOOK_URL doesn't look like a Discord webhook URL "
+            "(expected https://discord.com/api/webhooks/<id>/<token>). "
+            f"Got a value of length {len(webhook_url)} starting with "
+            f"{webhook_url[:30]!r}. Check for truncation or an extra "
+            "character introduced when it was copied into the secret.")
+
+
 def post_discord(webhook_url: str, payload: dict, chart_path=None, timeout=30):
     """POST the embed (with the chart attached) to a Discord webhook.
 
@@ -524,6 +560,7 @@ def post_discord(webhook_url: str, payload: dict, chart_path=None, timeout=30):
     error body) instead of a bare 204, which is worth the extra latency
     for a once-a-day job.
     """
+    _validate_webhook_url(webhook_url)
     content_type, body = _encode_multipart(payload, chart_path)
     sep = "&" if "?" in webhook_url else "?"
     req = urllib.request.Request(f"{webhook_url}{sep}wait=true", data=body,
@@ -704,7 +741,7 @@ def main():
                   f"{cfg['host']}:{cfg['port']}")
 
     if "discord" in channels:
-        webhook = (args.discord_webhook
+        webhook = ((args.discord_webhook or "").strip()
                   or os.environ.get("DISCORD_WEBHOOK_URL", "").strip())
         payload = build_discord_payload(s, perf, attach_chart=bool(chart_path))
 

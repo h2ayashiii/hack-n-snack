@@ -417,6 +417,30 @@ POST し、JSON の Embed（`payload_json`）とチャート画像（`files[0]`�
 はボット判定されて `403 (Cloudflare error 1010)` で弾かれるため、
 `post_discord()` では明示的な User-Agent ヘッダーを付与しています。
 
+**③ よくあるエラー**
+
+| エラー | 意味 | 対処 |
+|---|---|---|
+| `403 ... error code: 1010` | Cloudflare のボット判定でブロックされた（Discord には未到達） | 既に対応済み（明示的な User-Agent を送信）。これが出る場合は別の要因を疑う |
+| `404 ... "Unknown Webhook", code: 10015` | リクエストは Discord に届いたが、その Webhook ID/トークンの組が存在しない | 右記参照 |
+| `401 ... "Invalid Webhook Token"` | Webhook が無効化・削除されている | Discord 側で Webhook を再作成し、URL を Secret に登録し直す |
+
+`404 Unknown Webhook` は Discord API からの正規の応答で、リクエスト自体は
+正しく届いています。主な原因は次のいずれかです。
+
+- Webhook を Discord 側で削除・再生成した後、GitHub の Secret を
+  更新していない（新しい URL に差し替える）
+- Secret への貼り付け時に URL の一部が欠けた・改行や空白が混入した
+
+後者を早期に検出するため、`daily_report.py` は送信前に URL の形式
+（`https://discord.com/api/webhooks/<id>/<token>` の形か、空白・改行が
+混入していないか）を検証し、明らかにおかしい場合はネットワークに出す
+前に具体的なエラーメッセージで停止します（`_validate_webhook_url`）。
+このチェックを通過してなお `404` になる場合は、**Discord 側で Webhook
+が現存しない**ことを意味するので、Discord のチャンネル設定から Webhook
+の状態を確認し、必要なら再作成して新しい URL を Secret に登録し直して
+ください。
+
 ### 5.6 GitHub Actions による自動実行
 
 `.github/workflows/daily-signal.yml` が `cron: "30 22 * * 1-5"`（UTC）で

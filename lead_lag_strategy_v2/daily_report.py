@@ -328,10 +328,17 @@ not investment advice. Transaction costs and slippage are not modelled.
 # ---------------------------------------------------------------------------
 # Message assembly and delivery
 # ---------------------------------------------------------------------------
-def build_message(s, sender, recipients, perf=None, chart_path=None):
-    """Assemble a multipart/alternative message with the chart inlined."""
+def assemble_message(subject, sender, recipients, text, html_fn,
+                     chart_path=None, filename="signal.png"):
+    """Assemble a multipart/alternative message with the chart inlined.
+
+    ``html_fn`` is called with the Content-ID of the inlined chart (or
+    ``None`` when there is no chart) and returns the HTML body, so the
+    caller does not have to know how the cid is minted.  Shared with
+    ``review_report.py``.
+    """
     msg = EmailMessage()
-    msg["Subject"] = subject_line(s, perf)
+    msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
     msg["Date"] = formatdate(localtime=True)
@@ -344,14 +351,22 @@ def build_message(s, sender, recipients, perf=None, chart_path=None):
             chart_bytes = fh.read()
         chart_cid = make_msgid(domain="lead-lag.local")[1:-1]  # strip <>
 
-    msg.set_content(render_text(s, perf))
-    msg.add_alternative(render_html(s, perf, chart_cid), subtype="html")
+    msg.set_content(text)
+    msg.add_alternative(html_fn(chart_cid), subtype="html")
 
     if chart_bytes:
         html_part = msg.get_payload()[-1]
         html_part.add_related(chart_bytes, maintype="image", subtype="png",
-                              cid=f"<{chart_cid}>", filename="signal.png")
+                              cid=f"<{chart_cid}>", filename=filename)
     return msg
+
+
+def build_message(s, sender, recipients, perf=None, chart_path=None):
+    """Assemble the daily signal e-mail."""
+    return assemble_message(
+        subject_line(s, perf), sender, recipients, render_text(s, perf),
+        lambda cid: render_html(s, perf, cid), chart_path,
+        filename="signal.png")
 
 
 def smtp_config(args):
@@ -388,11 +403,15 @@ def send_message(msg, cfg):
                          to_addrs=cfg["recipients"])
 
 
-def write_dry_run(msg, s, out_dir):
-    """Persist the rendered message so CI can upload it as an artifact."""
-    stamp = pd.Timestamp(s["signal_date"]).date()
-    eml = os.path.join(out_dir, f"daily_report_{stamp}.eml")
-    html = os.path.join(out_dir, f"daily_report_{stamp}.html")
+def write_dry_run(msg, s, out_dir, prefix="daily_report", date_key="signal_date"):
+    """Persist the rendered message so CI can upload it as an artifact.
+
+    ``prefix``/``date_key`` let the post-close review reuse this with its
+    own file name and its own date field.
+    """
+    stamp = pd.Timestamp(s[date_key]).date()
+    eml = os.path.join(out_dir, f"{prefix}_{stamp}.eml")
+    html = os.path.join(out_dir, f"{prefix}_{stamp}.html")
     with open(eml, "wb") as fh:
         fh.write(bytes(msg))
     body = msg.get_body(preferencelist=("html",))
@@ -547,16 +566,17 @@ def post_discord(webhook_url: str, payload: dict, chart_path=None, timeout=30):
             f"Discord webhook POST failed ({e.code}): {detail}") from e
 
 
-def write_discord_dry_run(payload: dict, s, out_dir):
+def write_discord_dry_run(payload: dict, s, out_dir, prefix="discord_payload",
+                          date_key="signal_date"):
     """Persist the rendered payload so CI can upload it as an artifact."""
-    stamp = pd.Timestamp(s["signal_date"]).date()
-    path = os.path.join(out_dir, f"discord_payload_{stamp}.json")
+    stamp = pd.Timestamp(s[date_key]).date()
+    path = os.path.join(out_dir, f"{prefix}_{stamp}.json")
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
     return path
 
 
-def _mask_webhook(url: str) -> str:
+def mask_webhook(url: str) -> str:
     """Never print the webhook token in full -- it's a bearer credential
     that lets anyone post to the channel."""
     tail = url.rsplit("/", 1)[-1]
@@ -719,7 +739,7 @@ def main():
         else:
             post_discord(webhook, payload, chart_path)
             print(f"[sent] discord: {payload['embeds'][0]['title']} "
-                  f"-> {_mask_webhook(webhook)}")
+                  f"-> {mask_webhook(webhook)}")
 
     return 0
 

@@ -92,9 +92,14 @@ python daily_report.py --date 2024-11-01 --offline --dry-run --channels discord
 python daily_report.py                                     # send via e-mail (needs SMTP_* env)
 python daily_report.py --channels discord                  # post to Discord (needs DISCORD_WEBHOOK_URL)
 python daily_report.py --channels email,discord             # both
+
+# Post-close review: how the published book actually did (see .github/workflows/jp-close-review.yml)
+python review_report.py --dry-run                          # render only → .eml + .html and/or discord_review.json
+python review_report.py --date 2024-11-01 --offline --dry-run
+python review_report.py --channels discord                 # post the review to Discord
 ```
 
-Outputs go to `output/` (gitignored). Single-date: `output/realtime_signal_YYYY-MM-DD.png`. Range: `output/realtime_signal_START_END.png` (RdYlGn heatmap, ▲=LONG / ▼=SHORT). Daily report: `output/daily_report_YYYY-MM-DD.{eml,html}` and/or `output/discord_payload_YYYY-MM-DD.json`.
+Outputs go to `output/` (gitignored). Single-date: `output/realtime_signal_YYYY-MM-DD.png`. Range: `output/realtime_signal_START_END.png` (RdYlGn heatmap, ▲=LONG / ▼=SHORT). Daily report: `output/daily_report_YYYY-MM-DD.{eml,html}` and/or `output/discord_payload_YYYY-MM-DD.json`. Post-close review: `output/review_report_YYYY-MM-DD.{eml,html}`, `output/discord_review_YYYY-MM-DD.json`, `output/review_YYYY-MM-DD.png`.
 
 ### Architecture
 
@@ -103,13 +108,20 @@ Outputs go to `output/` (gitignored). Single-date: `output/realtime_signal_YYYY-
 - **`verify_logic.py`** — synthetic data generation from the idealized factor model; verifies Propositions 1–2 and reproduces Table 2
 - **`daily_report.py`** — reuses `realtime_run`'s `get_data` / `build_prior` / `snapshot_at` (signal computed once regardless of channel), then dispatches to one or more independently-configured delivery channels selected via `--channels` / `$REPORT_CHANNELS` (default `email`):
   - **email** — multipart HTML+text (inline chart, trailing 20-session realised performance) via SMTP. Config: `SMTP_HOST/PORT/USER/PASSWORD/STARTTLS`, `REPORT_FROM/TO`; defaults are `@example.com` mock addresses, unset `SMTP_HOST` falls back to writing the message to disk.
-  - **discord** — a single embed (top-q/bottom-q book, factor scores, trailing performance, chart attached) POSTed as `multipart/form-data` to a webhook URL, stdlib `urllib` only (no `requests` dependency). Config: `DISCORD_WEBHOOK_URL`; unset falls back to writing the JSON payload to disk. The webhook URL is a bearer credential — never logged in full (`_mask_webhook`). `post_discord()` sets an explicit `User-Agent`: discord.com sits behind Cloudflare, which blocks urllib's default `Python-urllib/x.y` UA as a bot signature (`403`, Cloudflare error 1010) before the request reaches Discord.
+  - **discord** — a single embed (top-q/bottom-q book, factor scores, trailing performance, chart attached) POSTed as `multipart/form-data` to a webhook URL, stdlib `urllib` only (no `requests` dependency). Config: `DISCORD_WEBHOOK_URL`; unset falls back to writing the JSON payload to disk. The webhook URL is a bearer credential — never logged in full (`mask_webhook`). `post_discord()` sets an explicit `User-Agent`: discord.com sits behind Cloudflare, which blocks urllib's default `Python-urllib/x.y` UA as a bot signature (`403`, Cloudflare error 1010) before the request reaches Discord.
+- **`review_report.py`** — post-close counterpart to `daily_report.py`: scores the published book against the JP session that just closed. Reuses `daily_report`'s delivery plumbing verbatim (`resolve_channels`, `smtp_config`, `assemble_message`, `post_discord`, the dry-run writers), so it needs no configuration of its own. Per predicted ETF it reports open, close, the move in yen, the open-to-close %, the contribution `w_j × roc_j`, and whether the direction was right; at book level the return (= long leg − short leg), direction hit rate, Spearman rank IC vs realised, the TOPIX-17 equal-weight mean, and a trailing `--history-days` (default 20) summary re-scored the same way.
+
+**Review timing/pairing**: the session being reviewed is *not yet* a day both markets traded (the U.S. has not closed), so `fetch_prices`'s common-day filter drops it. `review_report.jp_session_frames()` lays a Japan-only download (`realtime_run.fetch_jp_prices`, same `threads=False` + retry treatment) over the joint frames to bring it back, degrading to the common-day frames if that fetch fails. The book being scored is the one from the last common day *strictly before* the session — exactly what `daily_report.py` publishes off `rcc.index[-1]`. When the U.S. was shut the day before (~8×/year) no new book was published, so `stale_book` is set and every renderer says the previous book was carried.
 
 **Real-data handling** (`realtime_run.fetch_prices` / `build_prior`): only days both markets traded are kept; pre-inception NaN is preserved (XLRE 2015-10, XLC 2018-06) so the 2010–2014 prior window survives; U.S. tickers lacking a full estimation window are dropped from that day's joint PCA. `fetch_prices` calls `yf.download(..., threads=False)` — yfinance's default threaded mode has concurrent workers write to a shared sqlite tz-cache (`~/.cache/py-yfinance/`), which occasionally raises `database is locked` for a single ticker without the caller seeing an exception (it just shows up as a missing-data gap downstream); serial fetching plus a tail-completeness check + retry (3 attempts, backoff) closes that failure mode.
 
 ### Scheduled run
 
-`.github/workflows/daily-signal.yml` runs `daily_report.py` at `30 22 * * 1-5` UTC — after the U.S. close, ~1.5h before the JP open. Scheduled runs pass `--require-live --skip-if-stale 0` so a synthetic or stale book is never sent; `workflow_dispatch` exposes `date` / `dry_run` / `offline` / `channels` inputs. Channel selection comes from the `REPORT_CHANNELS` repo variable, but **this workflow's own default (when that variable is unset) is `discord`**, not `daily_report.py`'s script-level default of `email` — so setting only the `DISCORD_WEBHOOK_URL` secret is enough to turn on daily Discord delivery. Rendered output is always uploaded as an artifact. Note GitHub disables cron workflows after 60 days of repo inactivity.
+`.github/workflows/daily-signal.yml` runs `daily_report.py` at `30 22 * * 1-5` UTC — after the U.S. close, ~1.5h before the JP open. Scheduled runs pass `--require-live --skip-if-stale 0` so a synthetic or stale book is never sent; `workflow_dispatch` exposes `date` / `dry_run` / `offline` / `channels` inputs. Channel selection comes from the `REPORT_CHANNELS` repo variable, but **this workflow's own default (when that variable is unset) is `discord`**, not `daily_report.py`'s script-level default of `email` — so setting only the `DISCORD_WEBHOOK_URL` secret is enough to turn on daily Discord delivery. Rendered output is always uploaded as an artifact.
+
+`.github/workflows/jp-close-review.yml` runs `review_report.py` at `0 7 * * 1-5` UTC — 16:00 JST, 1h after the JP close (slack for Yahoo to settle the daily bars) and well before the next U.S. open. Same secrets/variables and same `discord` default as the signal job, so enabling it needs no extra configuration; scheduled runs pass `--require-live --skip-if-stale 0`, and at 07:00 UTC the runner's date already equals the JST session date so that check is exact.
+
+Note GitHub disables cron workflows after 60 days of repo inactivity.
 
 ---
 

@@ -170,7 +170,9 @@ MDD -9.58% と、リスク調整後リターンと最大ドローダウンの両
 | `verify_logic.py` | **ロジック検証**: 理想化モデルから合成データを生成し、命題1–2と表2の結論を再現。多面的な図を `output/verify_logic.png` に出力 |
 | `realtime_run.py` | **リアルタイム実行**: 最新データ（yfinance、失敗時は合成）から現時点の因子構造・シグナル・翌日のロング/ショート建玉を出力。チャートを `output/` に保存 |
 | `daily_report.py` | **日次レポート**: シグナルをメール（HTML/テキスト、SMTP）と Discord（Embed、Webhook）のどちらか／両方で配信（第5節） |
-| `../.github/workflows/daily-signal.yml` | **日次自動実行**: GitHub Actions の cron で毎営業日 `daily_report.py` を実行 |
+| `review_report.py` | **クローズ後レポート**: 日本市場の引け後に、配信済みの建玉が実際にどうなったか（円・％・寄与・当否）を同じチャネルで配信（第6節） |
+| `../.github/workflows/daily-signal.yml` | **日次自動実行**: GitHub Actions の cron で毎営業日 `daily_report.py` を実行（日本オープン前） |
+| `../.github/workflows/jp-close-review.yml` | **クローズ後自動実行**: GitHub Actions の cron で毎営業日 `review_report.py` を実行（日本クローズ後） |
 | `output/` | 生成されるチャート・図の出力先（git 管理外） |
 | `README.md` | 本ファイル |
 
@@ -290,6 +292,10 @@ python realtime_run.py --output-dir /tmp/charts # 出力先ディレクトリを
 
 シグナルの計算は配信チャネルに関係なく1回だけ行われ（`realtime_run.py`
 と同じ経路）、その結果を各チャネル向けに描画してから送るだけです。
+
+配信した建玉の**結果**（日本市場クローズ後の損益レポート）は第6節の
+`review_report.py` が担当します。設定（SMTP / Webhook）は本節のものを
+そのまま共有するため、追加の設定は必要ありません。
 
 ### 5.1 配信内容
 
@@ -458,7 +464,93 @@ Open-to-Close）に沿った時間帯です。
 
 ---
 
-## 6. 検証結果（合成データ）
+## 6. 日本市場クローズ後の結果レポート
+
+第5節の `daily_report.py` が**日本市場のオープン前**に「今日の建玉」を
+配信するのに対し、`review_report.py` は**日本市場のクローズ後**に、その
+建玉が実際にどうなったかを配信します。予測した各銘柄について
+
+- 寄付値・引け値
+- **プラスマイナスの値**（引け − 寄付、円）
+- **パーセント**（Open-to-Close リターン、式2）
+- ブック全体への寄与 `w_j × roc_j`
+- 予測方向が当たったか（✓ / ✗）
+
+を一覧にし、ブック全体の損益・方向的中率・順位IC もあわせて出します。
+
+### 6.1 タイミング
+
+```
+   day t     米国 Close-to-Close      → シグナル（daily_report.py が配信）
+   day t+1   日本 Open-to-Close       → 実現値（review_report.py が採点）
+```
+
+採点対象の日本セッションは、その時点ではまだ「日米双方が取引した日」に
+なっていません（米国が引けていないため）。`realtime_run.fetch_prices` は
+日米共通営業日だけを残すので、そのままでは当日の日本セッションが落ちて
+しまいます。そこで `review_report.jp_session_frames` が**日本銘柄だけの
+追加ダウンロード**（`realtime_run.fetch_jp_prices`）を共通営業日フレームに
+上書きし、直近セッションを復元します。この追加取得も `threads=False` +
+リトライで、5.6節と同じ yfinance の sqlite ロック問題を回避しています。
+
+採点対象セッションに対するシグナル日は「その日より**厳密に前**の直近の
+日米共通営業日」＝ `daily_report.py` が実際に配信した建玉です。米国が前日
+休場だった場合（年8回程度）は新しいシグナルが発行されていないため、前日の
+建玉を持ち越したものとして採点し、レポートに明示的な注記が入ります。
+
+### 6.2 配信内容
+
+| チャネル | 内容 |
+|---|---|
+| メール | ブック損益・方向的中率・順位IC・TOPIX-17平均のサマリー、LONG/SHORT 全銘柄の寄付/引け/円変化/％/寄与/当否、直近20セッションの実績、予測 vs 実現の対比チャート（インライン画像）、日本17業種の実現リターン順ランキング |
+| Discord | 同じ内容を1つの Embed に要約。LONG/SHORT 各5銘柄を `✅/❌ 銘柄 ％ 円` の形で表示し、直近20セッションの実績とチャートを添付。Embed の色はブック損益の符号（プラス=緑／マイナス=赤）で変わります |
+
+### 6.3 手動実行
+
+```bash
+# 生成のみ（SMTP/Discordに接続しない）
+# → output/review_report_YYYY-MM-DD.{eml,html} と/または
+#   output/discord_review_YYYY-MM-DD.json、output/review_YYYY-MM-DD.png
+python review_report.py --dry-run
+
+# 過去の特定セッションを採点（ネットワーク不要）
+python review_report.py --date 2024-11-01 --offline --dry-run
+
+# 直近セッションの採点結果を Discord へ投稿
+python review_report.py --channels discord
+```
+
+主なオプション（`--channels` / `--to` / `--from` / `--discord-webhook` /
+`--dry-run` / `--require-live` / `--offline` / `--no-chart` は
+`daily_report.py` と同じ意味・同じ環境変数）:
+
+| オプション | 意味 |
+|---|---|
+| `--date` | 採点する日本セッション（既定: 取得できた最新セッション） |
+| `--skip-if-stale N` | 最新の日本セッションが N 日より古ければ何も配信せず正常終了（`--date` 指定時は無視） |
+| `--history-days N` | 直近何セッション分の実績を集計するか（既定20、`0` で無効） |
+
+### 6.4 GitHub Actions による自動実行
+
+`.github/workflows/jp-close-review.yml` が `cron: "0 7 * * 1-5"`（UTC）で
+毎営業日実行します。
+
+```
+07:00 UTC = 16:00 JST  … 日本クローズ（15:00 JST）の1時間後
+          = 03:00 ET   … 次の米国オープンより十分前
+```
+
+日次シグナル側（`daily-signal.yml`）と同じ Secrets / Variables をそのまま
+使うため、**追加の設定は不要**です（`DISCORD_WEBHOOK_URL` を設定済みなら
+そのまま両方が動きます）。チャネル未指定時の既定が `discord` である点も
+同じです。スケジュール実行では `--require-live --skip-if-stale 0` が付き、
+日本市場が休場だった日や引け値がまだ配信されていない場合は何も送らずに
+正常終了します。生成物は Artifacts（`jp-close-review-<run_id>`、保持30日）
+へアップロードされます。
+
+---
+
+## 7. 検証結果（合成データ）
 
 `verify_logic.py` の実行例（seed=0）:
 
@@ -483,7 +575,7 @@ DOUBLE     47.27 14.27  3.31  -7.11
 
 ---
 
-## 7. 開発情報・実装メモ
+## 8. 開発情報・実装メモ
 
 - **設計方針**: `common.py` が論文の式番号と1対1に対応する純粋関数群を提供し、
   検証スクリプトとリアルタイムスクリプトはこれを呼び出すだけにしている。
@@ -542,7 +634,7 @@ DOUBLE     47.27 14.27  3.31  -7.11
 
 ---
 
-## 8. 参考
+## 9. 参考
 
 中川慧・竹本悠城・久保健治・加藤真大,
 "Lead-lag strategies for Japanese and U.S. sectors using subspace regularization PCA",

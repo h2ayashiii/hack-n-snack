@@ -467,6 +467,7 @@ def save_chart_single(s, path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    plt.style.use("seaborn-v0_8-dark")
 
     order = np.argsort(s["z_hat"])
     z = s["z_hat"][order]
@@ -516,6 +517,7 @@ def save_chart_range(snapshots, path):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
+    plt.style.use("seaborn-v0_8-dark")
 
     n_jp = len(C.JP_TICKERS)
     n_dates = len(snapshots)

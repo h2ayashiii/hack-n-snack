@@ -550,6 +550,7 @@ def save_review_chart(r, path, hist=None):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
+    plt.style.use("seaborn-v0_8-dark")
 
     order = np.argsort(r["z_hat"])          # weakest at the bottom
     labels = [f"{C.JP_TICKERS[i].replace('.T', '')}  "

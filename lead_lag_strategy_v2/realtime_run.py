@@ -148,6 +148,69 @@ def fetch_prices(prior_start="2010-01-01", retries=3, retry_delay=5):
         f"yfinance fetch failed after {retries} attempts") from last_err
 
 
+def fetch_jp_prices(lookback_days=200, retries=3, retry_delay=5):
+    """Download open/close for the Japanese ETFs only.
+
+    :func:`fetch_prices` keeps only the days on which *both* markets
+    traded, which is what the joint PCA needs but drops the session a
+    review job actually cares about: right after the Japanese close on
+    day t+1 the U.S. has not closed yet that day, so the freshest
+    Japanese bar is not (yet) a common day and disappears from the joint
+    frame.  This fetch has no such filter, so the session that just
+    closed survives.
+
+    ``threads=False`` and the retry loop are there for the same reason
+    as in :func:`fetch_prices` (yfinance's shared sqlite tz-cache).
+    """
+    import yfinance as yf
+
+    start = dt.date.today() - dt.timedelta(days=lookback_days)
+    end = dt.date.today() + dt.timedelta(days=1)
+
+    last_err = None
+    delay = retry_delay
+    for attempt in range(1, retries + 1):
+        try:
+            raw = yf.download(C.JP_TICKERS, start=start.isoformat(),
+                              end=end.isoformat(), auto_adjust=True,
+                              progress=False, group_by="column",
+                              threads=False)
+            if raw is None or len(raw) == 0:
+                raise RuntimeError("yfinance returned no data")
+
+            open_ = raw["Open"][C.JP_TICKERS]
+            close = raw["Close"][C.JP_TICKERS]
+
+            traded = close.notna().sum(axis=1) > len(C.JP_TICKERS) // 2
+            open_ = open_.loc[traded]
+            close = close.loc[traded]
+            if len(close) == 0:
+                raise RuntimeError("no Japanese trading days in the window")
+
+            # Every TOPIX-17 ETF has been listed for the whole lookback,
+            # so a gap in the last few sessions means yfinance dropped a
+            # ticker rather than that the market was shut.
+            recent = close.tail(5)
+            gaps = list(recent.columns[recent.isna().any()])
+            if gaps:
+                raise RuntimeError(
+                    f"incomplete recent data for {gaps} "
+                    f"(likely a transient yfinance fetch failure)")
+
+            return open_, close
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                print(f"[warn] yfinance JP fetch attempt {attempt}/{retries} "
+                      f"failed ({type(e).__name__}: {e}); retrying in "
+                      f"{delay}s.", file=sys.stderr)
+                time.sleep(delay)
+                delay *= 2
+
+    raise RuntimeError(
+        f"yfinance JP fetch failed after {retries} attempts") from last_err
+
+
 def synthetic_window(seed=None, start_date="2010-01-01"):
     """Fallback: generate a full history from the idealized model.
 

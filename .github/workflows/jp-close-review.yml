@@ -1,0 +1,134 @@
+name: JP close review
+
+# Post-close counterpart to daily-signal.yml.  That job publishes the book
+# before the Japanese open; this one scores it after the Japanese close and
+# reports what each predicted ETF actually did -- the move in yen, the move
+# in percent, and whether the predicted direction was right.
+#
+# Timing follows the same convention: the U.S. close-to-close return on day
+# t predicts the Japanese open-to-close return on day t+1, so the review has
+# to land after the Japanese close.
+#
+#   07:00 UTC  =  16:00 JST  -- 1h after the Japanese close (06:00 UTC),
+#                               enough slack for Yahoo Finance to settle the
+#                               daily bars
+#              =  03:00 ET   -- well before the next U.S. open, so the
+#                               signal job's data is untouched
+#
+# The Japanese session being reviewed is not yet a day both markets traded
+# (the U.S. has not closed), so review_report.py lays a Japan-only download
+# over the joint frames to pick it up.
+#
+# GitHub only guarantees best-effort scheduling and can delay cron runs by
+# several minutes to over an hour at peak times.  Note also that GitHub
+# disables scheduled workflows in a repository with no activity for 60 days;
+# push a commit or re-enable it from the Actions tab.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Japanese session to review (YYYY-MM-DD). Empty = latest available."
+        required: false
+        type: string
+      dry_run:
+        description: "Render only, never send"
+        required: false
+        type: boolean
+        default: false
+      offline:
+        description: "Use the synthetic fallback instead of the network"
+        required: false
+        type: boolean
+        default: false
+      channels:
+        description: "Delivery channels, comma-separated (email, discord). Empty = repo default (REPORT_CHANNELS variable, or 'discord' for this workflow)."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jp-close-review
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: lead_lag_strategy_v2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: lead_lag_strategy_v2/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --extra live --frozen
+
+      - name: Build flags
+        id: flags
+        env:
+          IN_DATE: ${{ inputs.date }}
+          IN_DRY: ${{ inputs.dry_run }}
+          IN_OFFLINE: ${{ inputs.offline }}
+          IN_CHANNELS: ${{ inputs.channels }}
+        run: |
+          flags=""
+          if [ -n "$IN_DATE" ]; then flags="$flags --date $IN_DATE"; fi
+          if [ "$IN_DRY" = "true" ]; then flags="$flags --dry-run"; fi
+          if [ -n "$IN_CHANNELS" ]; then flags="$flags --channels $IN_CHANNELS"; fi
+          if [ "$IN_OFFLINE" = "true" ]; then
+            # Manual pipeline test on synthetic data: no freshness check,
+            # since simulated prices are never "today's market".
+            flags="$flags --offline"
+          else
+            # Never report a synthetic result: fail loudly if prices are missing.
+            flags="$flags --require-live"
+            if [ -z "$IN_DATE" ]; then
+              # Nothing to review on a day the Japanese market was shut, so
+              # exit quietly rather than re-sending the previous session.
+              # 07:00 UTC is the same calendar date as 16:00 JST, so "today"
+              # on the runner is the session date we expect.
+              flags="$flags --skip-if-stale 0"
+            fi
+          fi
+          echo "flags=$flags" >> "$GITHUB_OUTPUT"
+          echo "Using flags:$flags"
+
+      - name: Score the book against the Japanese close
+        env:
+          # Which channels to use when --channels wasn't passed above.
+          # Same convention as daily-signal.yml: this workflow is deployed
+          # for Discord, so with the REPORT_CHANNELS repo variable unset it
+          # defaults to "discord" here (the script's own default is "email",
+          # which is for direct/manual invocation).
+          REPORT_CHANNELS: ${{ vars.REPORT_CHANNELS || 'discord' }}
+          # Same secrets as the signal job -- nothing extra to configure.
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_STARTTLS: ${{ secrets.SMTP_STARTTLS }}
+          REPORT_FROM: ${{ vars.REPORT_FROM }}
+          REPORT_TO: ${{ vars.REPORT_TO }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: uv run python review_report.py ${{ steps.flags.outputs.flags }}
+
+      - name: Upload rendered review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jp-close-review-${{ github.run_id }}
+          path: lead_lag_strategy_v2/output/
+          if-no-files-found: ignore
+          retention-days: 30

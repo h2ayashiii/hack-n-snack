@@ -506,12 +506,15 @@ def build_discord_payload(s, perf=None, attach_chart=False) -> dict:
     return {"username": "Lead-Lag PCA Bot", "embeds": [embed]}
 
 
-def _encode_multipart(payload: dict, chart_path: str | None):
+def _encode_multipart(payload: dict, chart_path: str | None, extra_files=None):
     """Minimal multipart/form-data encoder (stdlib only, no ``requests``).
 
     Discord's webhook endpoint expects the JSON payload under a
-    ``payload_json`` part and, when an image is attached, the file under
-    ``files[0]`` with the embed referencing it via ``attachment://name``.
+    ``payload_json`` part and each attached file under ``files[N]``, with
+    the embed referencing the chart via ``attachment://name``.  ``chart_path``
+    always lands at ``files[0]``; ``extra_files`` -- an iterable of
+    ``(filename, content_type, data)`` -- fills the following slots and is
+    just for download (nothing in the embed points at them).
     """
     boundary = f"leadlag-{uuid.uuid4().hex}"
     nl = "\r\n"
@@ -521,29 +524,45 @@ def _encode_multipart(payload: dict, chart_path: str | None):
          f"Content-Type: application/json{nl}{nl}"
          f"{json.dumps(payload)}{nl}").encode("utf-8")
     ]
+    slot = 0
     if chart_path and os.path.exists(chart_path):
         with open(chart_path, "rb") as fh:
             img = fh.read()
         chunks.append(
             (f"--{boundary}{nl}"
-             f'Content-Disposition: form-data; name="files[0]"; '
+             f'Content-Disposition: form-data; name="files[{slot}]"; '
              f'filename="signal.png"{nl}'
              f"Content-Type: image/png{nl}{nl}").encode("utf-8")
             + img + nl.encode("utf-8")
         )
+        slot += 1
+    for filename, content_type, data in (extra_files or []):
+        chunks.append(
+            (f"--{boundary}{nl}"
+             f'Content-Disposition: form-data; name="files[{slot}]"; '
+             f'filename="{filename}"{nl}'
+             f"Content-Type: {content_type}{nl}{nl}").encode("utf-8")
+            + data + nl.encode("utf-8")
+        )
+        slot += 1
     chunks.append(f"--{boundary}--{nl}".encode("utf-8"))
     return f"multipart/form-data; boundary={boundary}", b"".join(chunks)
 
 
-def post_discord(webhook_url: str, payload: dict, chart_path=None, timeout=30):
+def post_discord(webhook_url: str, payload: dict, chart_path=None,
+                 extra_files=None, timeout=30):
     """POST the embed (with the chart attached) to a Discord webhook.
+
+    ``extra_files`` -- ``(filename, content_type, data)`` tuples -- are
+    attached alongside the chart as plain downloads (e.g. a standalone
+    HTML tool), not referenced by the embed itself.
 
     Raises on failure so CI surfaces the problem, matching send_message().
     ``?wait=true`` makes Discord return the created message (or a detailed
     error body) instead of a bare 204, which is worth the extra latency
     for a once-a-day job.
     """
-    content_type, body = _encode_multipart(payload, chart_path)
+    content_type, body = _encode_multipart(payload, chart_path, extra_files)
     sep = "&" if "?" in webhook_url else "?"
     req = urllib.request.Request(f"{webhook_url}{sep}wait=true", data=body,
                                  method="POST")

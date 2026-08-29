@@ -79,7 +79,8 @@ import numpy as np
 import pandas as pd
 
 import common as C
-from realtime_run import build_prior, ensure_output_dir, get_data, save_chart_single
+from realtime_run import (build_prior, ensure_output_dir, get_data,
+                          save_chart_single, staleness_days)
 
 MOCK_ADDRESS = "lead-lag-signals@example.com"
 MOCK_SENDER = "lead-lag-bot@example.com"
@@ -671,7 +672,11 @@ def main():
                     K=args.K, q=args.q)
     s["live"] = live
 
-    stale = (pd.Timestamp(dt.date.today()) - pd.Timestamp(s["signal_date"])).days
+    # cutoff_hour=20: the U.S. close (and thus the next fresh signal) can't
+    # exist before ~20:00 UTC, so a run any time before that -- even one
+    # GitHub delayed into the small hours of the next UTC day -- is still
+    # scored against today's signal rather than being marked stale.
+    stale = staleness_days(s["signal_date"], cutoff_hour=20)
     if args.date is None and stale > 0:
         print(f"[warn] latest available signal date is "
               f"{pd.Timestamp(s['signal_date']).date()}, {stale} day(s) old.",

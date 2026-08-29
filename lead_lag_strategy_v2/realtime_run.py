@@ -246,6 +246,33 @@ def get_data(prior_start="2010-01-01", allow_network=True):
     return o, c, "SYNTHETIC fallback (idealized model)"
 
 
+def staleness_days(reference_date, cutoff_hour: int,
+                   now: dt.datetime | None = None) -> int:
+    """Calendar days between "now" and ``reference_date``, in UTC.
+
+    Used by ``daily_report.py`` / ``review_report.py`` to decide whether
+    the latest available signal/review is actually today's or is left
+    over from a day the market didn't trade. GitHub's scheduler runs cron
+    workflows best-effort and can delay a run by hours -- sometimes past
+    midnight UTC and well before the next session's close could plausibly
+    have produced new data. A bare calendar-date comparison at that point
+    would flag an otherwise-fresh result as one day stale purely because
+    the job started late, and the daily report would silently skip
+    sending (see the daily-signal/jp-close-review workflow logs).
+
+    To avoid that, "now" is treated as still being the previous UTC
+    calendar day until ``cutoff_hour``. Pass the UTC hour of the next
+    close this data depends on (comfortably after it, e.g. 20 for the
+    U.S. close or 6 for the Japanese close) so the rollback only ever
+    masks a scheduling delay, never an actual missed trading day.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    today = now.date()
+    if now.hour < cutoff_hour:
+        today -= dt.timedelta(days=1)
+    return (pd.Timestamp(today) - pd.Timestamp(reference_date)).days
+
+
 # ---------------------------------------------------------------------------
 # Prior estimation (shared across all snapshots)
 # ---------------------------------------------------------------------------

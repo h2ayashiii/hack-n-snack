@@ -58,7 +58,7 @@ from scipy.stats import spearmanr
 import common as C
 import daily_report as D
 from realtime_run import (build_prior, ensure_output_dir, fetch_jp_prices,
-                          get_data, snapshot_at)
+                          get_data, snapshot_at, staleness_days)
 
 
 # ---------------------------------------------------------------------------
@@ -707,10 +707,14 @@ def main():
     r = review_at(rcc, C0, jp_open, jp_close, review_date, source, **kw)
     r["live"] = live
 
-    # The job runs at ~15:00 JST, which is still the same calendar date in
-    # UTC (06:00 UTC), so today's UTC date is the session date to expect.
-    stale = (pd.Timestamp(dt.date.today())
-             - pd.Timestamp(r["review_date"])).days
+    # The job runs at ~15:00 JST (06:00 UTC), just after the Japanese
+    # close, so ordinarily today's UTC date is the session date to
+    # expect. But GitHub's scheduler can delay a run by hours -- past
+    # midnight UTC and well before the *next* Japanese close (~06:00 UTC)
+    # could plausibly have produced a new session to review -- so a run
+    # that late is still scored against today's session rather than being
+    # mistaken for one running on a day the market didn't trade.
+    stale = staleness_days(r["review_date"], cutoff_hour=6)
     if args.date is None and stale > 0:
         print(f"[warn] latest Japanese session is "
               f"{pd.Timestamp(r['review_date']).date()}, {stale} day(s) old.",

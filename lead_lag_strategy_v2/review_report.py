@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import sys
 
@@ -631,6 +632,190 @@ def save_review_chart(r, path, hist=None):
 
 
 # ---------------------------------------------------------------------------
+# P&L calculator (standalone HTML, vanilla JS)
+# ---------------------------------------------------------------------------
+def _calculator_data(r, hist=None) -> dict:
+    """Book rows plus the actual and trailing-average book returns.
+
+    Only book members (``w != 0``) are included, ordered longs-then-shorts
+    by conviction -- the same ordering as the rest of the review.  There is
+    no per-name *predicted* return: the model ranks direction, not
+    magnitude, so the only "expected" figure this can honestly offer is the
+    trailing realised average from :func:`review_history`.
+    """
+    longs, shorts = _order(r)
+    rows = []
+    for i in longs + shorts:
+        rows.append(dict(
+            ticker=C.JP_TICKERS[i],
+            label=C.JP_LABELS.get(C.JP_TICKERS[i], ""),
+            side="LONG" if r["w"][i] > 0 else "SHORT",
+            weight=float(r["w"][i]),
+            z_hat=float(r["z_hat"][i]),
+            roc=float(r["roc"][i]),
+            contrib=float(r["contrib"][i]),
+            hit=bool(np.sign(r["w"][i]) == np.sign(r["roc"][i])),
+        ))
+    return dict(
+        review_date=str(pd.Timestamp(r["review_date"]).date()),
+        signal_date=str(pd.Timestamp(r["signal_date"]).date()),
+        live=bool(r["live"]),
+        port_return=r["port_return"],
+        hist_mean=hist["mean"] if hist else None,
+        hist_n=hist["n"] if hist else None,
+        rows=rows,
+    )
+
+
+def build_calculator_html(r, hist=None) -> str:
+    """Standalone, self-contained HTML+JS "how much would I have made"
+    calculator for one reviewed session.
+
+    Enter a principal and it scales two already-computed numbers against
+    it: the session's *actual* book return (exact -- everything here has
+    already closed), and, for context, the trailing-average book return
+    from :func:`review_history` labelled as an estimate, not a forecast
+    (the model has no per-session return-magnitude prediction to draw on).
+    No network calls, no external assets -- opens from disk or as a
+    downloaded e-mail/Discord attachment.
+    """
+    data = _calculator_data(r, hist)
+    payload = json.dumps(data)
+    live_note = "" if data["live"] else (
+        '<p class="warn">⚠ SYNTHETIC fallback data -- for demonstration '
+        'only, do not use these figures for real decisions.</p>')
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lead-Lag PCA -- P&amp;L simulator -- {data['review_date']}</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+         max-width: 760px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }}
+  h1 {{ font-size: 1.3rem; margin-bottom: 4px; }}
+  .sub {{ color: #666; font-size: 0.85rem; margin-top: 0; }}
+  .warn {{ color: #92400e; background: #fef3c7; padding: 8px 12px;
+          border-radius: 6px; font-size: 0.9rem; }}
+  .note {{ color: #666; font-size: 0.8rem; }}
+  label {{ font-weight: 600; }}
+  input#principal {{ font-size: 1.1rem; padding: 6px 10px; width: 220px;
+                     margin-left: 8px; }}
+  .cards {{ display: flex; gap: 16px; margin: 20px 0; flex-wrap: wrap; }}
+  .card {{ flex: 1; min-width: 240px; border: 1px solid #ddd; border-radius: 8px;
+          padding: 14px 16px; }}
+  .card h2 {{ font-size: 0.9rem; margin: 0 0 6px; color: #444; }}
+  .card .amount {{ font-size: 1.6rem; font-weight: 700; }}
+  .pos {{ color: #2ca02c; }}
+  .neg {{ color: #d62728; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 8px; }}
+  th, td {{ padding: 5px 8px; text-align: right; border-bottom: 1px solid #eee; }}
+  th:first-child, td:first-child {{ text-align: left; }}
+  td.side-long {{ color: #2ca02c; font-weight: 600; }}
+  td.side-short {{ color: #d62728; font-weight: 600; }}
+  footer {{ margin-top: 24px; color: #999; font-size: 0.75rem; }}
+</style>
+</head>
+<body>
+<h1>Lead-Lag PCA_SUB -- P&amp;L simulator</h1>
+<p class="sub">Signal day {data['signal_date']} (U.S. close-to-close) &rarr;
+   reviewed session {data['review_date']} (Japanese open-to-close)</p>
+{live_note}
+<p><label for="principal">Principal</label>
+   <input id="principal" type="number" value="1000000" min="0" step="10000"></p>
+
+<div class="cards">
+  <div class="card">
+    <h2>Actual P&amp;L -- this session (exact)</h2>
+    <div class="amount" id="actual-amount">--</div>
+    <div class="note">book return <span id="actual-pct">--</span> = long leg &minus; short leg</div>
+  </div>
+  <div class="card">
+    <h2>Estimated P&amp;L -- trailing average</h2>
+    <div class="amount" id="est-amount">--</div>
+    <div class="note" id="est-note">--</div>
+  </div>
+</div>
+<p class="note">The model ranks direction (long/short), not the size of the move, so
+there is no per-session return forecast to scale. The "estimated" card instead
+projects the principal at the trailing mean daily book return as a track-record
+reference point, not a prediction for this specific session.</p>
+
+<table id="book">
+  <thead><tr><th>Ticker</th><th>Sector</th><th>Side</th><th>Weight</th>
+  <th>&Zcirc;</th><th>Realised %</th><th>Hit</th><th>P&amp;L</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<footer>Research output only -- not investment advice. Costs/slippage not modelled.</footer>
+
+<script>
+const DATA = {payload};
+
+function fmtMoney(x) {{
+  const sign = x < 0 ? "-" : "+";
+  return sign + Math.abs(x).toLocaleString(undefined, {{maximumFractionDigits: 0}});
+}}
+function fmtPct(x) {{
+  return (x >= 0 ? "+" : "") + (100 * x).toFixed(2) + "%";
+}}
+function colourClass(x) {{ return x >= 0 ? "pos" : "neg"; }}
+
+function render() {{
+  const principal = parseFloat(document.getElementById("principal").value) || 0;
+
+  const actual = principal * DATA.port_return;
+  const actualAmount = document.getElementById("actual-amount");
+  actualAmount.textContent = fmtMoney(actual);
+  actualAmount.className = "amount " + colourClass(actual);
+  document.getElementById("actual-pct").textContent = fmtPct(DATA.port_return);
+
+  const estAmount = document.getElementById("est-amount");
+  const estNote = document.getElementById("est-note");
+  if (DATA.hist_mean === null) {{
+    estAmount.textContent = "n/a";
+    estAmount.className = "amount";
+    estNote.textContent = "trailing history unavailable for this run";
+  }} else {{
+    const est = principal * DATA.hist_mean;
+    estAmount.textContent = fmtMoney(est);
+    estAmount.className = "amount " + colourClass(est);
+    estNote.textContent = `mean daily book return ${{fmtPct(DATA.hist_mean)}} `
+      + `over trailing ${{DATA.hist_n}} sessions`;
+  }}
+
+  const tbody = document.querySelector("#book tbody");
+  tbody.innerHTML = "";
+  for (const row of DATA.rows) {{
+    const tr = document.createElement("tr");
+    const pnl = principal * row.contrib;
+    tr.innerHTML = `<td>${{row.ticker}}</td><td>${{row.label}}</td>`
+      + `<td class="side-${{row.side.toLowerCase()}}">${{row.side}}</td>`
+      + `<td>${{row.weight.toFixed(3)}}</td>`
+      + `<td>${{row.z_hat.toFixed(3)}}</td>`
+      + `<td class="${{colourClass(row.roc)}}">${{fmtPct(row.roc)}}</td>`
+      + `<td>${{row.hit ? "OK" : "MISS"}}</td>`
+      + `<td class="${{colourClass(pnl)}}">${{fmtMoney(pnl)}}</td>`;
+    tbody.appendChild(tr);
+  }}
+}}
+
+document.getElementById("principal").addEventListener("input", render);
+render();
+</script>
+</body>
+</html>
+"""
+
+
+def save_calculator_html(r, path, hist=None):
+    """Write the standalone P&L calculator to ``path``."""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(build_calculator_html(r, hist))
+    print(f"[calculator] written to {path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -661,6 +846,8 @@ def main():
                     help="skip the network and use the synthetic fallback")
     ap.add_argument("--no-chart", action="store_true",
                     help="do not render or attach the chart")
+    ap.add_argument("--no-calculator", action="store_true",
+                    help="do not render or attach the P&L calculator")
     ap.add_argument("--skip-if-stale", type=int, default=-1, metavar="DAYS",
                     help="exit 0 without sending when the latest Japanese "
                          "session is more than DAYS calendar days old "
@@ -735,11 +922,17 @@ def main():
             print(f"[warn] trailing review history unavailable "
                   f"({type(e).__name__}: {e})", file=sys.stderr)
 
+    d_str = str(pd.Timestamp(r["review_date"]).date())
+
     chart_path = None
     if not args.no_chart:
-        d_str = str(pd.Timestamp(r["review_date"]).date())
         chart_path = os.path.join(out_dir, f"review_{d_str}.png")
         save_review_chart(r, chart_path, hist)
+
+    calc_path = None
+    if not args.no_calculator:
+        calc_path = os.path.join(out_dir, f"review_calc_{d_str}.html")
+        save_calculator_html(r, calc_path, hist)
 
     # --- deliver ----------------------------------------------------------
     channels = D.resolve_channels(args)
@@ -750,6 +943,13 @@ def main():
             subject_line(r), cfg["sender"], cfg["recipients"],
             render_text(r, hist), lambda cid: render_html(r, hist, cid),
             chart_path, filename="review.png")
+        if calc_path:
+            # A real attachment, not inlined into the HTML body: most mail
+            # clients strip <script> from HTML e-mails, so the calculator
+            # only works once the recipient downloads and opens it.
+            with open(calc_path, "rb") as fh:
+                msg.add_attachment(fh.read(), maintype="text", subtype="html",
+                                   filename=f"review_calc_{d_str}.html")
 
         dry = args.dry_run or not cfg["host"]
         if dry and not args.dry_run:
@@ -774,6 +974,10 @@ def main():
         webhook = (args.discord_webhook
                    or os.environ.get("DISCORD_WEBHOOK_URL", "").strip())
         payload = build_discord_payload(r, hist, attach_chart=bool(chart_path))
+        if calc_path:
+            payload["embeds"][0]["footer"]["text"] += (
+                "  |  \U0001F4CE P&L simulator attached "
+                f"(review_calc_{d_str}.html) -- open in a browser.")
 
         dry = args.dry_run or not webhook
         if dry and not args.dry_run:
@@ -786,7 +990,12 @@ def main():
                                            date_key="review_date")
             print(f"[dry-run] discord payload written to {path}")
         else:
-            D.post_discord(webhook, payload, chart_path)
+            extra_files = None
+            if calc_path:
+                with open(calc_path, "rb") as fh:
+                    extra_files = [(f"review_calc_{d_str}.html", "text/html",
+                                    fh.read())]
+            D.post_discord(webhook, payload, chart_path, extra_files=extra_files)
             print(f"[sent] discord: {payload['embeds'][0]['title']} "
                   f"-> {D.mask_webhook(webhook)}")
 

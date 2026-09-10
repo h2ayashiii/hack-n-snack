@@ -172,7 +172,7 @@ MDD -9.58% と、リスク調整後リターンと最大ドローダウンの両
 | `daily_report.py` | **日次レポート**: シグナルをメール（HTML/テキスト、SMTP）と Discord（Embed、Webhook）のどちらか／両方で配信（第5節） |
 | `review_report.py` | **クローズ後レポート**: 日本市場の引け後に、配信済みの建玉が実際にどうなったか（円・％・寄与・当否）を同じチャネルで配信（第6節） |
 | `../.github/workflows/daily-signal.yml` | **日次自動実行**: GitHub Actions の cron で毎営業日 `daily_report.py` を実行（日本オープン前） |
-| `../.github/workflows/jp-close-review.yml` | **クローズ後自動実行**: GitHub Actions の cron で毎営業日 `review_report.py` を実行（日本クローズ後） |
+| `../.github/workflows/jp-close-review.yml` | **クローズ後自動実行（デフォルト無効）**: GitHub Actions の cron で毎営業日 `review_report.py` を実行（日本クローズ後）。`ENABLE_JP_CLOSE_REVIEW` リポジトリ変数を `true` にするまでスケジュール実行はスキップされる |
 | `output/` | 生成されるチャート・図の出力先（git 管理外） |
 | `README.md` | 本ファイル |
 
@@ -541,12 +541,21 @@ python review_report.py --channels discord
 ```
 
 日次シグナル側（`daily-signal.yml`）と同じ Secrets / Variables をそのまま
-使うため、**追加の設定は不要**です（`DISCORD_WEBHOOK_URL` を設定済みなら
-そのまま両方が動きます）。チャネル未指定時の既定が `discord` である点も
-同じです。スケジュール実行では `--require-live --skip-if-stale 0` が付き、
-日本市場が休場だった日や引け値がまだ配信されていない場合は何も送らずに
-正常終了します。生成物は Artifacts（`jp-close-review-<run_id>`、保持30日）
-へアップロードされます。
+使うため、配信自体に追加の設定は不要です（`DISCORD_WEBHOOK_URL` を設定済み
+なら動きます）。チャネル未指定時の既定が `discord` である点も同じです。
+
+**このワークフローはデフォルトで無効（OFF）です。** cron によるスケジュール
+実行は、リポジトリ変数 `ENABLE_JP_CLOSE_REVIEW` を `true` に設定するまで
+何も行いません（`workflow_dispatch` による手動実行は変数の値に関わらず常に
+動きます）。有効化するには GitHub の
+Settings → Secrets and variables → Actions → Variables で
+`ENABLE_JP_CLOSE_REVIEW=true` を追加してください。
+
+有効化されている場合、スケジュール実行は `--require-live` / `--skip-if-stale`
+を付けずに毎回必ず配信します（日本市場が休場だった日は前回セッションの
+持ち越し採点、ライブ取得に失敗した場合は synthetic データとして、いずれも
+その旨を明示した上で送信されます）。生成物は Artifacts
+（`jp-close-review-<run_id>`、保持30日）へアップロードされます。
 
 ---
 

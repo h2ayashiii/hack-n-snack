@@ -23,6 +23,11 @@ name: JP close review
 # several minutes to over an hour at peak times.  Note also that GitHub
 # disables scheduled workflows in a repository with no activity for 60 days;
 # push a commit or re-enable it from the Actions tab.
+#
+# This job is OFF by default: the scheduled (cron) trigger is a no-op
+# unless the repo variable ENABLE_JP_CLOSE_REVIEW is set to "true"
+# (Settings -> Secrets and variables -> Actions -> Variables). A manual
+# workflow_dispatch run always runs regardless of the variable.
 
 on:
   schedule:
@@ -57,6 +62,10 @@ concurrency:
 
 jobs:
   review:
+    # Default-off: a scheduled run is skipped unless ENABLE_JP_CLOSE_REVIEW
+    # is explicitly set to "true" as a repo variable. workflow_dispatch
+    # always runs, since triggering it by hand is already an explicit ask.
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_JP_CLOSE_REVIEW == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -91,17 +100,15 @@ jobs:
             # Manual pipeline test on synthetic data: no freshness check,
             # since simulated prices are never "today's market".
             flags="$flags --offline"
-          else
-            # Never report a synthetic result: fail loudly if prices are missing.
-            flags="$flags --require-live"
-            if [ -z "$IN_DATE" ]; then
-              # Nothing to review on a day the Japanese market was shut, so
-              # exit quietly rather than re-sending the previous session.
-              # 07:00 UTC is the same calendar date as 16:00 JST, so "today"
-              # on the runner is the session date we expect.
-              flags="$flags --skip-if-stale 0"
-            fi
           fi
+          # No --require-live / --skip-if-stale here: this workflow must
+          # send every scheduled weekday run unconditionally, even if
+          # yfinance's daily bar for today's Japanese close hasn't settled
+          # yet by run time (in which case the latest available session,
+          # and the review, simply repeats the prior one; review_report.py
+          # already flags this via stale_book) or live data is unavailable
+          # (in which case get_data() falls back to a synthetic window and
+          # the report says so).
           echo "flags=$flags" >> "$GITHUB_OUTPUT"
           echo "Using flags:$flags"
 

@@ -85,15 +85,14 @@ jobs:
             # Manual pipeline test on synthetic data: no freshness check,
             # since simulated prices are never "today's market".
             flags="$flags --offline"
-          else
-            # Never mail a synthetic book: fail loudly if prices are missing.
-            flags="$flags --require-live"
-            if [ -z "$IN_DATE" ]; then
-              # Nothing new to say on a day the two markets did not both
-              # trade, so exit quietly rather than re-mail yesterday's book.
-              flags="$flags --skip-if-stale 0"
-            fi
           fi
+          # No --require-live / --skip-if-stale here: this workflow must
+          # send every scheduled weekday run unconditionally, even if
+          # yfinance's daily bar for today hasn't settled yet by run time
+          # (in which case the latest available signal, and today's book,
+          # simply repeats the prior day's) or live data is unavailable
+          # (in which case get_data() falls back to a synthetic window and
+          # the report says so).
           echo "flags=$flags" >> "$GITHUB_OUTPUT"
           echo "Using flags:$flags"
 

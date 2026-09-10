@@ -91,17 +91,15 @@ jobs:
             # Manual pipeline test on synthetic data: no freshness check,
             # since simulated prices are never "today's market".
             flags="$flags --offline"
-          else
-            # Never report a synthetic result: fail loudly if prices are missing.
-            flags="$flags --require-live"
-            if [ -z "$IN_DATE" ]; then
-              # Nothing to review on a day the Japanese market was shut, so
-              # exit quietly rather than re-sending the previous session.
-              # 07:00 UTC is the same calendar date as 16:00 JST, so "today"
-              # on the runner is the session date we expect.
-              flags="$flags --skip-if-stale 0"
-            fi
           fi
+          # No --require-live / --skip-if-stale here: this workflow must
+          # send every scheduled weekday run unconditionally, even if
+          # yfinance's daily bar for today's Japanese close hasn't settled
+          # yet by run time (in which case the latest available session,
+          # and the review, simply repeats the prior one; review_report.py
+          # already flags this via stale_book) or live data is unavailable
+          # (in which case get_data() falls back to a synthetic window and
+          # the report says so).
           echo "flags=$flags" >> "$GITHUB_OUTPUT"
           echo "Using flags:$flags"
 

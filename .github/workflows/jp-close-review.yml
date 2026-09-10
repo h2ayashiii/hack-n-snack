@@ -23,6 +23,11 @@ name: JP close review
 # several minutes to over an hour at peak times.  Note also that GitHub
 # disables scheduled workflows in a repository with no activity for 60 days;
 # push a commit or re-enable it from the Actions tab.
+#
+# This job is OFF by default: the scheduled (cron) trigger is a no-op
+# unless the repo variable ENABLE_JP_CLOSE_REVIEW is set to "true"
+# (Settings -> Secrets and variables -> Actions -> Variables). A manual
+# workflow_dispatch run always runs regardless of the variable.
 
 on:
   schedule:
@@ -57,6 +62,10 @@ concurrency:
 
 jobs:
   review:
+    # Default-off: a scheduled run is skipped unless ENABLE_JP_CLOSE_REVIEW
+    # is explicitly set to "true" as a repo variable. workflow_dispatch
+    # always runs, since triggering it by hand is already an explicit ask.
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_JP_CLOSE_REVIEW == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:

@@ -880,8 +880,9 @@ def main():
         return 1
 
     tickers = C.US_TICKERS + C.JP_TICKERS
-    rcc, C0 = build_prior(close, tickers, prior_start=args.prior_start,
-                          prior_end=args.prior_end)
+    rcc, C0, _prior_window = build_prior(
+        close, tickers, prior_start=args.prior_start,
+        prior_end=args.prior_end)
     jp_open, jp_close, extended = jp_session_frames(
         open_, close, allow_network=live and not args.offline)
     if extended:

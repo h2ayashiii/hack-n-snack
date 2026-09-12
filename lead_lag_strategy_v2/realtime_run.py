@@ -285,6 +285,11 @@ def build_prior(close_df, tickers, prior_start="2010-01-01",
     eq. (9), so ``DataFrame.corr`` matches eqs. (8)-(9) while tolerating
     tickers that list mid-window).  Tickers with no quotes at all in the
     window (XLC, XLRE) are handled inside :func:`common.build_C0`.
+
+    Returns ``(rcc, C0, prior_window)``.  ``prior_window`` is the
+    ``(first, last)`` pair of dates C_full was actually estimated on, so
+    callers can tell whether a signal date they ask for is inside it --
+    the paper keeps them disjoint (C_full 2010-2014, evaluation from 2015).
     """
     rcc = C.close_to_close_returns(close_df[tickers])
     V0 = C.build_prior_vectors(tickers)
@@ -298,20 +303,56 @@ def build_prior(close_df, tickers, prior_start="2010-01-01",
         prior_rcc = rcc.iloc[:prior_days]
     C_full = prior_rcc.corr(min_periods=60).values
     C0 = C.build_C0(C_full, V0)
-    return rcc, C0
+    window = ((prior_rcc.index[0], prior_rcc.index[-1]) if len(prior_rcc)
+              else None)
+    return rcc, C0, window
 
 
 # ---------------------------------------------------------------------------
 # Single-date snapshot
 # ---------------------------------------------------------------------------
+PRIOR_DIRECTION_NAMES = ("global", "US-Japan spread", "cyclical-defensive")
+
+
+def factor_labels(VK: np.ndarray, tickers_sub) -> list[str]:
+    """Name each retained eigenvector by the prior direction it lines up with.
+
+    The eigenvectors of C^reg_t are *not* the prior directions v1, v2, v3:
+    they diagonalise a blend of C_t and C0, and nothing makes the k-th
+    eigenvalue correspond to the k-th prior direction.  Labelling them
+    "global / US-Japan spread / cyclical-defensive" by position, as this
+    script used to, is therefore wrong whenever the order differs -- which
+    it routinely does.  Each label is matched by |cos| to the prior
+    direction instead, and carries that cosine so a weak match is visible.
+
+    The sign of an eigenvector is arbitrary, so the sign of the factor score
+    f_k it produces carries no meaning on its own; only the resulting
+    zhat_J = V_J f does (B = V_J V_U^T is invariant to the flip).
+    """
+    V0 = C.build_prior_vectors(list(tickers_sub))
+    cosines = np.abs(VK.T @ V0)                 # (K, K0), both unit columns
+    out = []
+    for k in range(VK.shape[1]):
+        j = int(np.argmax(cosines[k]))
+        name = (PRIOR_DIRECTION_NAMES[j] if j < len(PRIOR_DIRECTION_NAMES)
+                else f"prior dir {j + 1}")
+        out.append(f"{name} |cos|={cosines[k, j]:.2f}")
+    return out
+
+
 def snapshot_at(rcc: pd.DataFrame, C0: np.ndarray, signal_date,
-                source: str, L=60, lam=0.9, K=3, q=0.3):
+                source: str, L=60, lam=0.9, K=3, q=0.3,
+                mode="paper", prior_window=None, allow_in_sample=False):
     """Compute the lead-lag signal for a specific signal date.
 
     Parameters
     ----------
     signal_date : the date of the U.S. close we use as the signal (day t).
                   The prediction is for the JP open-to-close on day t+1.
+    mode        : predictor variant, see :func:`common.predictor_matrix`.
+    prior_window: the ``(first, last)`` dates C0 was estimated on, as
+                  returned by :func:`build_prior`.  A signal date inside it
+                  is in-sample and gets a warning unless ``allow_in_sample``.
 
     U.S. tickers without complete data over the estimation window (e.g.
     XLC before its 2018-06 inception) are dropped from that day's
@@ -329,7 +370,7 @@ def snapshot_at(rcc: pd.DataFrame, C0: np.ndarray, signal_date,
     dates = rcc.index
 
     pos = dates.searchsorted(signal_ts, side="right") - 1
-    if pos < 0 or dates[pos] > signal_ts:
+    if pos < 0:
         raise ValueError(f"No trading data on or before {signal_date}")
     actual_date = dates[pos]
 
@@ -339,41 +380,40 @@ def snapshot_at(rcc: pd.DataFrame, C0: np.ndarray, signal_date,
             f"(need {L} rows, have {pos})"
         )
 
+    if (prior_window and not allow_in_sample
+            and prior_window[0] <= actual_date <= prior_window[1]):
+        print(f"[warn] signal date {actual_date.date()} falls inside the "
+              f"prior window {prior_window[0].date()}.."
+              f"{prior_window[1].date()}, so C0 was estimated on data that "
+              f"includes it. The paper keeps the two disjoint (C_full "
+              f"2010-2014, evaluation from 2015). Pass allow_in_sample=True "
+              f"to silence this.", file=sys.stderr)
+
     window = rcc_v[pos - L:pos]
     today = rcc_v[pos]
 
-    avail = np.isfinite(window).all(axis=0) & np.isfinite(today)
-    if not avail[jp_idx].all():
-        raise ValueError(
-            f"Missing Japanese data in the window ending {actual_date.date()}"
-        )
-    us_avail = [int(i) for i in us_idx if avail[i]]
-    if len(us_avail) < K:
-        raise ValueError(
-            f"Only {len(us_avail)} U.S. tickers available on "
-            f"{actual_date.date()} (need at least K={K})"
-        )
+    try:
+        sel, us_idx_sub, jp_idx_sub, C0_sub = C.select_subuniverse(
+            window, today, us_idx, jp_idx, C0, K=K)
+    except ValueError as e:
+        raise ValueError(f"{e} on {actual_date.date()}") from None
 
-    # sub-universe kept in [U.S. block, JP block] order
-    sel = np.array(us_avail + list(jp_idx))
-    us_idx_sub = np.arange(len(us_avail))
-    jp_idx_sub = np.arange(len(us_avail), len(sel))
-    C0_sub = C0[np.ix_(sel, sel)]
-
-    res = C.compute_signal_for_day(window[:, sel], today[us_avail],
+    res = C.compute_signal_for_day(window[:, sel], today[sel[us_idx_sub]],
                                    us_idx_sub, jp_idx_sub,
-                                   C0_sub, lam=lam, K=K)
+                                   C0_sub, lam=lam, K=K, mode=mode)
     z_hat = res["z_hat_J"]
     w = C.long_short_weights(z_hat, q=q)
+    sel_tickers = [tickers[i] for i in sel]
 
     return dict(source=source, signal_date=actual_date, z_hat=z_hat,
                 f=res["f"], evals=res["evals"], z_U=res["z_U"], w=w,
-                K=K, lam=lam, L=L, q=q,
-                us_used=[tickers[i] for i in us_avail])
+                K=K, lam=lam, L=L, q=q, mode=mode,
+                f_labels=factor_labels(res["VK"], sel_tickers),
+                us_used=[tickers[i] for i in sel[us_idx_sub]])
 
 
 def snapshot_range(rcc: pd.DataFrame, C0: np.ndarray, start_date, end_date,
-                   source: str, L=60, lam=0.9, K=3, q=0.3):
+                   source: str, L=60, lam=0.9, K=3, q=0.3, **kw):
     """Compute snapshots for all trading dates in [start_date, end_date].
 
     Returns a list of snapshot dicts (only dates with sufficient history).
@@ -386,7 +426,8 @@ def snapshot_range(rcc: pd.DataFrame, C0: np.ndarray, start_date, end_date,
     snapshots = []
     for d in target_dates:
         try:
-            s = snapshot_at(rcc, C0, d, source, L=L, lam=lam, K=K, q=q)
+            s = snapshot_at(rcc, C0, d, source, L=L, lam=lam, K=K, q=q,
+                            **kw)
             snapshots.append(s)
         except ValueError:
             pass
@@ -430,10 +471,12 @@ def print_snapshot(s):
         print(f"   lambda_{k+1:<2d} = {ev[k]:7.3f}  ({100*ev[k]/tot:5.1f}%) {bar}{tag}")
 
     print("\n Common-factor scores f_t extracted from today's U.S. shock:")
-    names = ["global", "US-Japan spread", "cyclical-defensive"]
+    labels = s.get("f_labels") or [f"factor {k+1}" for k in range(s["K"])]
     for k in range(s["K"]):
-        nm = names[k] if k < len(names) else f"factor {k+1}"
-        print(f"   f_{k+1} ({nm:<18s}) = {s['f'][k]:+.3f}")
+        print(f"   f_{k+1} ({labels[k]:<28s}) = {s['f'][k]:+.3f}")
+    print("   (eigenvectors are matched to the prior directions by |cos|, not"
+          " by rank;\n    their sign is arbitrary, so only zhat_J is"
+          " meaningful, not the sign of f_k)")
 
     order = np.argsort(s["z_hat"])[::-1]
     print("\n Predicted standardised Japanese returns  zhat_{J,t+1}  (ranked):")
@@ -640,6 +683,12 @@ def main():
     ap.add_argument("--lam", type=float, default=0.9, help="shrinkage lambda")
     ap.add_argument("--K", type=int, default=3, help="number of factors")
     ap.add_argument("--q", type=float, default=0.3, help="long/short quantile")
+    ap.add_argument("--predictor", choices=C.PREDICTOR_MODES, default="paper",
+                    help="'paper' = eq. (21) verbatim (default), 'ridge' = "
+                         "the Prop. 2 correction")
+    ap.add_argument("--allow-in-sample", action="store_true",
+                    help="silence the warning when the signal date falls "
+                         "inside the C0 prior window")
     ap.add_argument("--prior-start", default="2010-01-01",
                     help="download start and beginning of the prior "
                          "(C_full) training window")
@@ -669,14 +718,17 @@ def main():
     def run_once():
         o, c, src = get_data(args.prior_start, allow_network=not args.offline)
         tickers = C.US_TICKERS + C.JP_TICKERS
-        rcc, C0 = build_prior(c, tickers, prior_start=args.prior_start,
-                              prior_end=args.prior_end)
+        rcc, C0, prior_window = build_prior(
+            c, tickers, prior_start=args.prior_start,
+            prior_end=args.prior_end)
+        guard = dict(mode=args.predictor, prior_window=prior_window,
+                     allow_in_sample=args.allow_in_sample)
 
         # --- Range mode ---
         if args.start_date:
             snapshots = snapshot_range(
                 rcc, C0, args.start_date, args.end_date, src,
-                L=args.L, lam=args.lam, K=args.K, q=args.q,
+                L=args.L, lam=args.lam, K=args.K, q=args.q, **guard,
             )
             print_range_summary(snapshots)
             if not args.no_chart:
@@ -692,7 +744,7 @@ def main():
             signal_date = rcc.index[-1]
 
         s = snapshot_at(rcc, C0, signal_date, src,
-                        L=args.L, lam=args.lam, K=args.K, q=args.q)
+                        L=args.L, lam=args.lam, K=args.K, q=args.q, **guard)
         print_snapshot(s)
         if not args.no_chart:
             d_str = str(pd.Timestamp(s["signal_date"]).date())

@@ -85,7 +85,16 @@ from realtime_run import (build_prior, ensure_output_dir, get_data,
 MOCK_ADDRESS = "lead-lag-signals@example.com"
 MOCK_SENDER = "lead-lag-bot@example.com"
 
-FACTOR_NAMES = ["global", "US-Japan spread", "cyclical-defensive"]
+def factor_name(s, k):
+    """Label for factor k of snapshot ``s``.
+
+    Comes from ``realtime_run.factor_labels``, which matches each retained
+    eigenvector of C^reg_t to the prior direction it is closest to (by
+    |cos|) instead of assuming eigenvalue rank k *is* prior direction k --
+    it usually is not, and the cosine is printed so a weak match shows.
+    """
+    labels = s.get("f_labels")
+    return labels[k] if labels and k < len(labels) else f"factor {k + 1}"
 
 VALID_CHANNELS = {"email", "discord"}
 
@@ -184,8 +193,7 @@ def render_text(s, perf=None) -> str:
 
     out += ["", " Common-factor scores f_t (eq. 18):"]
     for k in range(s["K"]):
-        nm = FACTOR_NAMES[k] if k < len(FACTOR_NAMES) else f"factor {k+1}"
-        out.append(f"   f_{k+1} ({nm:<18s}) = {s['f'][k]:+.3f}")
+        out.append(f"   f_{k+1} ({factor_name(s, k):<28s}) = {s['f'][k]:+.3f}")
 
     ev = s["evals"]
     tot = ev[ev > 0].sum()
@@ -258,7 +266,7 @@ def render_html(s, perf=None, chart_cid=None) -> str:
 
     factors = "".join(
         f'<li>f<sub>{k+1}</sub> '
-        f'({FACTOR_NAMES[k] if k < len(FACTOR_NAMES) else f"factor {k+1}"}) '
+        f'({factor_name(s, k)}) '
         f'= <code>{s["f"][k]:+.3f}</code></li>'
         for k in range(s["K"]))
 
@@ -453,8 +461,8 @@ def build_discord_payload(s, perf=None, attach_chart=False) -> dict:
 
     factor_lines = []
     for k in range(s["K"]):
-        nm = FACTOR_NAMES[k] if k < len(FACTOR_NAMES) else f"factor {k+1}"
-        factor_lines.append(f"f_{k+1} ({nm}): `{s['f'][k]:+.3f}`")
+        factor_lines.append(
+            f"f_{k+1} ({factor_name(s, k)}): `{s['f'][k]:+.3f}`")
 
     fields = [
         {"name": f"\U0001F7E2 LONG ({len(longs)})",
@@ -680,8 +688,9 @@ def main():
         return 1
 
     tickers = C.US_TICKERS + C.JP_TICKERS
-    rcc, C0 = build_prior(close, tickers, prior_start=args.prior_start,
-                          prior_end=args.prior_end)
+    rcc, C0, _prior_window = build_prior(
+        close, tickers, prior_start=args.prior_start,
+        prior_end=args.prior_end)
 
     # --- signal -----------------------------------------------------------
     from realtime_run import snapshot_at

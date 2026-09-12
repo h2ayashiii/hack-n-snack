@@ -209,23 +209,89 @@ def regularized_pca(C_t: np.ndarray, C0: np.ndarray, lam: float = 0.9, K: int = 
 # ---------------------------------------------------------------------------
 # 6. Lead-lag signal (eqs. 17-21)
 # ---------------------------------------------------------------------------
-def leadlag_signal(VK: np.ndarray, us_idx, jp_idx, z_U: np.ndarray):
+PREDICTOR_MODES = ("paper", "ridge")
+
+
+def residual_variance(evals, K: int) -> float:
+    """sigma_U^2 estimate from the regularised spectrum.
+
+    The cross-section is standardised, so ``trace(C^reg_t) = N`` and the K
+    retained eigenvalues account for ``sum(l_1..l_K)`` of it.  What is left
+    over, per asset, is the idiosyncratic variance of the factor model of
+    eqs. (23)-(24):
+
+        sigma^2 ~= (N - sum_{k<=K} l_k) / N
+    """
+    evals = np.asarray(evals, dtype=float)
+    N = len(evals)
+    explained = float(np.clip(evals[:K].sum(), 0.0, N))
+    return max((N - explained) / N, 1e-6)
+
+
+def leadlag_signal(VK: np.ndarray, us_idx, jp_idx, z_U: np.ndarray,
+                   mode: str = "paper", sigma2: float | None = None):
     """Map today's U.S. shock into a prediction of tomorrow's Japanese returns.
 
         f_t        = V^(K)_{U,t}^T z_{U,t}        (eq. 18)  factor scores
         zhat_{J}   = V^(K)_{J,t} f_t              (eq. 19)  prediction
                    = B^(K)_t z_{U,t},  B = V_J V_U^T (eqs. 20-21)
+
+    ``mode`` selects which predictor is applied; see :func:`predictor_matrix`.
+    ``"ridge"`` needs ``sigma2`` (estimate it with :func:`residual_variance`).
     """
     VKU = VK[us_idx, :]          # (NU, K)
     VKJ = VK[jp_idx, :]          # (NJ, K)
-    f = VKU.T @ z_U              # (K,)
+    proj = VKU.T @ z_U           # (K,)
+    if mode == "paper":
+        f = proj
+    elif mode == "ridge":
+        if sigma2 is None:
+            raise ValueError("mode='ridge' requires sigma2")
+        K = VK.shape[1]
+        f = np.linalg.solve(VKU.T @ VKU + sigma2 * np.eye(K), proj)
+    else:
+        raise ValueError(f"unknown predictor mode {mode!r}")
     z_hat_J = VKJ @ f            # (NJ,)
     return z_hat_J, f
 
 
-def predictor_matrix(VK: np.ndarray, us_idx, jp_idx) -> np.ndarray:
-    """B^(K)_t = V^(K)_{J,t} V^(K)_{U,t}^T  (eq. 21), the rank<=K linear map."""
-    return VK[jp_idx, :] @ VK[us_idx, :].T
+def predictor_matrix(VK: np.ndarray, us_idx, jp_idx,
+                     mode: str = "paper",
+                     sigma2: float | None = None) -> np.ndarray:
+    """The rank<=K linear map from z_{U,t} to zhat_{J,t+1}.
+
+    ``mode="paper"`` (default) is the paper's eq. (21) verbatim::
+
+        B^(K)_t = V^(K)_{J,t} V^(K)_{U,t}^T
+
+    ``mode="ridge"`` is the general best linear predictor of Prop. 2::
+
+        B_t = V_J V_U^T (V_U V_U^T + sigma^2 I)^-1
+            = V_J (V_U^T V_U + sigma^2 I_K)^-1 V_U^T     (push-through)
+
+    The two agree only when ``V_U^T V_U = I_K``, which the proof of Prop. 2
+    assumes (it is used in the Woodbury step) but which a *block* of a joint
+    PCA eigenbasis never satisfies: for the paper's prior directions the U.S.
+    block has Gram ``[[0.39, 0.49, 0], [0.49, 0.61, 0], [0, 0, 0.50]]``.
+    Because the strategy ranks Japanese names cross-sectionally, the K x K
+    reweighting is *not* absorbed as a monotone rescaling -- it changes the
+    book.  ``"paper"`` stays the default so the reproduction is faithful;
+    ``"ridge"`` is the variant that matches eq. (25).
+
+    The second form is used below: it needs only a K x K solve, and adding
+    sigma^2 keeps it stable where ``V_U^T V_U`` is near-singular (the plain
+    whitening ``V_J (V_U^T V_U)^-1 V_U^T`` is not, with observed condition
+    numbers of order 1e5).
+    """
+    VKU, VKJ = VK[us_idx, :], VK[jp_idx, :]
+    if mode == "paper":
+        return VKJ @ VKU.T
+    if mode == "ridge":
+        if sigma2 is None:
+            raise ValueError("mode='ridge' requires sigma2")
+        K = VK.shape[1]
+        return VKJ @ np.linalg.solve(VKU.T @ VKU + sigma2 * np.eye(K), VKU.T)
+    raise ValueError(f"unknown predictor mode {mode!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -290,14 +356,60 @@ def performance_metrics(returns, periods_per_year: int = 252) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 9. Single-day signal helper (used by both scripts)
+# 9. Per-day estimation universe
+# ---------------------------------------------------------------------------
+def select_subuniverse(window: np.ndarray, today: np.ndarray,
+                       us_idx, jp_idx, C0: np.ndarray, K: int = 3):
+    """Restrict one day's joint PCA to the assets that actually have data.
+
+    The Japanese block must have a complete estimation window -- without it
+    there is nothing to predict.  U.S. tickers that lack one (XLRE before its
+    2015-10 inception, XLC before 2018-06) are dropped from *that day's*
+    joint PCA instead of killing the day outright, which is what the paper's
+    per-ticker sample sizes imply (Table 1: 2590 rows for most tickers, 2409
+    for XLRE, 1758 for XLC).
+
+    Only the U.S. block of ``today`` is examined: the signal reads the window
+    ``W_t = {t-L, ..., t-1}`` plus the U.S. close-to-close of day t, and never
+    the Japanese return of day t itself.
+
+    Returns ``(sel, us_idx_sub, jp_idx_sub, C0_sub)`` where ``sel`` indexes the
+    kept assets in [U.S. block, Japan block] order.  Raises ``ValueError`` when
+    the day is unusable.
+
+    ``C0`` is sub-selected rather than rebuilt: it is diagonal-normalised, so a
+    principal submatrix of ``Delta^-1/2 C_raw Delta^-1/2`` equals what eq. (12)
+    would produce from the restricted ``C_raw`` -- unit diagonal and rank <= K0
+    are both preserved.
+    """
+    us_idx = np.asarray(us_idx, dtype=int)
+    jp_idx = np.asarray(jp_idx, dtype=int)
+
+    win_ok = np.isfinite(window).all(axis=0)
+    if not win_ok[jp_idx].all():
+        raise ValueError("incomplete Japanese estimation window")
+
+    us_keep = us_idx[win_ok[us_idx] & np.isfinite(today)[us_idx]]
+    if len(us_keep) < K:
+        raise ValueError(
+            f"only {len(us_keep)} U.S. tickers available (need at least K={K})")
+
+    sel = np.concatenate([us_keep, jp_idx])
+    us_idx_sub = np.arange(len(us_keep))
+    jp_idx_sub = np.arange(len(us_keep), len(sel))
+    return sel, us_idx_sub, jp_idx_sub, C0[np.ix_(sel, sel)]
+
+
+# ---------------------------------------------------------------------------
+# 10. Single-day signal helper (used by both scripts)
 # ---------------------------------------------------------------------------
 def compute_signal_for_day(rcc_window: np.ndarray,
                            rcc_today_us: np.ndarray,
                            us_idx, jp_idx,
                            C0: np.ndarray,
                            lam: float = 0.9,
-                           K: int = 3):
+                           K: int = 3,
+                           mode: str = "paper"):
     """Run the full PCA pipeline for one rebalancing day.
 
     Parameters
@@ -306,6 +418,7 @@ def compute_signal_for_day(rcc_window: np.ndarray,
     rcc_today_us : (NU,)  close-to-close U.S. returns on the signal day t.
     us_idx,jp_idx: integer index arrays into the N-asset axis.
     C0           : subspace prior (set lam=0 to recover plain PCA).
+    mode         : predictor variant, see :func:`predictor_matrix`.
 
     Returns a dict with the standardised prediction, factor scores,
     eigen-spectrum and the top-K eigenvectors.
@@ -317,14 +430,16 @@ def compute_signal_for_day(rcc_window: np.ndarray,
     mu_us = mu[us_idx]
     sig_us = sig[us_idx]
     z_U = (rcc_today_us - mu_us) / sig_us             # eq. (17)
-    z_hat_J, f = leadlag_signal(VK, us_idx, jp_idx, z_U)
+    sigma2 = residual_variance(evals, K)
+    z_hat_J, f = leadlag_signal(VK, us_idx, jp_idx, z_U,
+                                mode=mode, sigma2=sigma2)
 
     return dict(z_hat_J=z_hat_J, f=f, evals=evals, VK=VK,
-                z_U=z_U, C_t=C_t)
+                z_U=z_U, C_t=C_t, sigma2=sigma2, mode=mode)
 
 
 # ---------------------------------------------------------------------------
-# 10. Full backtest loop
+# 11. Full backtest loop
 # ---------------------------------------------------------------------------
 def run_backtest(rcc: pd.DataFrame,
                  roc_J: pd.DataFrame,
@@ -335,13 +450,19 @@ def run_backtest(rcc: pd.DataFrame,
                  lam: float = 0.9,
                  K: int = 3,
                  q: float = 0.3,
-                 methods=("MOM", "PCA_PLAIN", "PCA_SUB", "DOUBLE")):
+                 methods=("MOM", "PCA_PLAIN", "PCA_SUB", "DOUBLE"),
+                 mode: str = "paper"):
     """Walk forward day by day and accumulate strategy returns.
 
     For each day t (with a full window behind it) the U.S. close-to-close
     shock observed at t is turned into a prediction of the Japanese
     open-to-close return realised at t+1; portfolios are formed from that
     prediction and marked to the realised roc_J at t+1.
+
+    Days are kept whenever the Japanese block has a full window and at least
+    K U.S. tickers do (:func:`select_subuniverse`), so the pre-inception NaN
+    of XLRE and XLC shrinks that day's U.S. cross-section instead of dropping
+    the day -- the same rule ``realtime_run.snapshot_at`` applies.
 
     Returns
     -------
@@ -365,32 +486,39 @@ def run_backtest(rcc: pd.DataFrame,
     T = len(rcc_v)
     for t in range(L, T - 1):
         window = rcc_v[t - L:t]                 # W_t = {t-L,...,t-1}
-        if not np.isfinite(window).all():
-            continue
-        today_us = rcc_v[t, us_idx]
-        if not np.isfinite(today_us).all():
-            continue
         realised = roc_v[t + 1]                 # next-day open-to-close
         if not np.isfinite(realised).all():
             continue
+        try:
+            sel, us_sub, jp_sub, C0_sub = select_subuniverse(
+                window, rcc_v[t], us_idx, jp_idx, C0, K=K)
+        except ValueError:
+            continue
+
+        window = window[:, sel]
+        today_us = rcc_v[t, sel[us_sub]]
 
         Z, mu, sig = standardize_window(window)
         C_t = correlation_from_Z(Z)
 
         # momentum signal (eq. 31): trailing-mean of Japanese cc returns
-        mom = mu[jp_idx]
+        mom = mu[jp_sub]
 
         # regularised / plain PCA signals
-        z_U = (today_us - mu[us_idx]) / sig[us_idx]
+        z_U = (today_us - mu[us_sub]) / sig[us_sub]
 
         sig_reg = None
         if any(m in methods for m in ("PCA_PLAIN", "PCA_SUB", "DOUBLE")):
             if "PCA_PLAIN" in methods:
-                VKp, _ = regularized_pca(C_t, C0, lam=0.0, K=K)
-                zhat_plain, _ = leadlag_signal(VKp, us_idx, jp_idx, z_U)
+                VKp, ev_p = regularized_pca(C_t, C0_sub, lam=0.0, K=K)
+                zhat_plain, _ = leadlag_signal(
+                    VKp, us_sub, jp_sub, z_U, mode=mode,
+                    sigma2=residual_variance(ev_p, K))
             if any(m in methods for m in ("PCA_SUB", "DOUBLE")):
-                VKr, _ = regularized_pca(C_t, C0, lam=lam, K=K)
-                zhat_reg, _ = leadlag_signal(VKr, us_idx, jp_idx, z_U)
+                VKr, ev_r = regularized_pca(C_t, C0_sub, lam=lam, K=K)
+                zhat_reg, _ = leadlag_signal(
+                    VKr, us_sub, jp_sub, z_U, mode=mode,
+                    sigma2=residual_variance(ev_r, K))
                 sig_reg = zhat_reg
 
         trade_dates.append(dates[t + 1])

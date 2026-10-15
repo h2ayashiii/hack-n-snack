@@ -5,22 +5,31 @@ name: Daily lead-lag signal
 # REPORT_CHANNELS below).
 #
 # Timing follows the paper's convention: the U.S. close-to-close return on
-# day t predicts the Japanese open-to-close return on day t+1, so the job
-# has to land after the U.S. close and before the Japanese open.
+# day t predicts the Japanese open-to-close return on day t+1, so the book
+# has to land after the U.S. close and before the Japanese open (09:00 JST
+# = 00:00 UTC).
 #
-#   22:30 UTC  =  18:30 ET (EST) / 17:30 ET (EDT)  -- 1.5-2.5h after the
-#                 U.S. close (21:00/20:00 UTC)
-#              =  07:30 JST next day               -- 1.5h before the
-#                 Japanese open (00:00 UTC)
+# GitHub's cron is best-effort and has been firing this job 1.5-7.5h late,
+# i.e. after the Japanese open.  So instead of one slot the job is armed
+# every 30 minutes from the U.S. close (20:00 UTC in EDT, 21:00 UTC in
+# EST) to the Japanese open, and daily_report.py --auto decides what each
+# run does from the real exchange calendars (market_calendar.py):
 #
-# GitHub only guarantees best-effort scheduling and can delay cron runs by
-# several minutes to over an hour at peak times, so the window is kept wide.
+#   * the target is the next Tokyo session whose open is still ahead --
+#     nothing is sent for a day Tokyo is shut, and nothing is sent late;
+#   * the signal is the last U.S. close before that open (after a U.S.
+#     holiday, the latest U.S. close; after a Japanese holiday, the U.S.
+#     session Tokyo missed), used only once it is 15 minutes old;
+#   * runs before that close settles, or after a book for that session
+#     was already delivered (state kept in the Actions cache), exit
+#     without sending.
+#
 # Note also that GitHub disables scheduled workflows in a repository with no
 # activity for 60 days; push a commit or re-enable it from the Actions tab.
 
 on:
   schedule:
-    - cron: "30 22 * * 1-5"
+    - cron: "17,47 20-23 * * 1-5"
   workflow_dispatch:
     inputs:
       date:
@@ -41,6 +50,11 @@ on:
         description: "Delivery channels, comma-separated (email, discord). Empty = repo default (REPORT_CHANNELS variable, or 'discord' for this workflow)."
         required: false
         type: string
+      auto:
+        description: "Behave like a scheduled run (calendar-gated, send once per JP session). Ignores 'date'."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -69,16 +83,29 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra live --frozen
 
+      - name: Restore delivery state
+        uses: actions/cache/restore@v4
+        with:
+          path: lead_lag_strategy_v2/state
+          key: daily-signal-state-${{ github.run_id }}
+          restore-keys: daily-signal-state-
+
       - name: Build flags
         id: flags
         env:
+          IS_SCHEDULE: ${{ github.event_name == 'schedule' }}
+          IN_AUTO: ${{ inputs.auto }}
           IN_DATE: ${{ inputs.date }}
           IN_DRY: ${{ inputs.dry_run }}
           IN_OFFLINE: ${{ inputs.offline }}
           IN_CHANNELS: ${{ inputs.channels }}
         run: |
           flags=""
-          if [ -n "$IN_DATE" ]; then flags="$flags --date $IN_DATE"; fi
+          if [ "$IS_SCHEDULE" = "true" ] || [ "$IN_AUTO" = "true" ]; then
+            flags="$flags --auto --state-file state/last_sent.json"
+          elif [ -n "$IN_DATE" ]; then
+            flags="$flags --date $IN_DATE"
+          fi
           if [ "$IN_DRY" = "true" ]; then flags="$flags --dry-run"; fi
           if [ -n "$IN_CHANNELS" ]; then flags="$flags --channels $IN_CHANNELS"; fi
           if [ "$IN_OFFLINE" = "true" ]; then
@@ -86,17 +113,14 @@ jobs:
             # since simulated prices are never "today's market".
             flags="$flags --offline"
           fi
-          # No --require-live / --skip-if-stale here: this workflow must
-          # send every scheduled weekday run unconditionally, even if
-          # yfinance's daily bar for today hasn't settled yet by run time
-          # (in which case the latest available signal, and today's book,
-          # simply repeats the prior day's) or live data is unavailable
-          # (in which case get_data() falls back to a synthetic window and
-          # the report says so).
+          # With --auto, a run that finds the U.S. close missing from
+          # yfinance or live data unavailable sends nothing (never a stale
+          # or synthetic book) and leaves the session to a later run.
           echo "flags=$flags" >> "$GITHUB_OUTPUT"
           echo "Using flags:$flags"
 
       - name: Generate and send the daily signal
+        id: report
         env:
           # Which channels to use when --channels wasn't passed above.
           # Comma-separated: "email", "discord", or "email,discord".
@@ -124,6 +148,13 @@ jobs:
           # With this unset the script falls back to a dry run.
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: uv run python daily_report.py ${{ steps.flags.outputs.flags }}
+
+      - name: Save delivery state
+        if: steps.report.outputs.sent == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: lead_lag_strategy_v2/state
+          key: daily-signal-state-${{ github.run_id }}
 
       - name: Upload rendered report
         if: always()

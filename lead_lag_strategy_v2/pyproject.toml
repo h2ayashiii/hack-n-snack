@@ -13,5 +13,6 @@ dependencies = [
 
 [project.optional-dependencies]
 live = [
+    "exchange-calendars>=4.13.2",
     "yfinance>=1.5.1",
 ]

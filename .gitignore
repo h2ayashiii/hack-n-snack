@@ -209,3 +209,6 @@ __marimo__/
 # Lead-lag strategy generated outputs
 lead_lag_strategy/results/
 lead_lag_strategy_v2/output/
+
+# daily-signal delivery state (persisted by the workflow cache, not git)
+lead_lag_strategy_v2/state/

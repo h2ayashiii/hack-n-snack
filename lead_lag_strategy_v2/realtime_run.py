@@ -158,6 +158,25 @@ def fetch_jp_prices(lookback_days=200, retries=3, retry_delay=5):
     Japanese bar is not (yet) a common day and disappears from the joint
     frame.  This fetch has no such filter, so the session that just
     closed survives.
+    """
+    return _fetch_one_market(C.JP_TICKERS, "JP", lookback_days, retries,
+                             retry_delay)
+
+
+def fetch_us_prices(lookback_days=30, retries=3, retry_delay=5):
+    """Download open/close for the U.S. ETFs only.
+
+    The pre-open counterpart of :func:`fetch_jp_prices`: a U.S. session
+    Tokyo did not trade (a Japanese holiday) is not a common day, so
+    :func:`fetch_prices` drops it -- yet it is the latest U.S. close
+    before the next Japanese open, which is what the daily signal needs.
+    """
+    return _fetch_one_market(C.US_TICKERS, "U.S.", lookback_days, retries,
+                             retry_delay)
+
+
+def _fetch_one_market(tickers, label, lookback_days, retries, retry_delay):
+    """Single-market download with no common-day filter.
 
     ``threads=False`` and the retry loop are there for the same reason
     as in :func:`fetch_prices` (yfinance's shared sqlite tz-cache).
@@ -171,25 +190,25 @@ def fetch_jp_prices(lookback_days=200, retries=3, retry_delay=5):
     delay = retry_delay
     for attempt in range(1, retries + 1):
         try:
-            raw = yf.download(C.JP_TICKERS, start=start.isoformat(),
+            raw = yf.download(tickers, start=start.isoformat(),
                               end=end.isoformat(), auto_adjust=True,
                               progress=False, group_by="column",
                               threads=False)
             if raw is None or len(raw) == 0:
                 raise RuntimeError("yfinance returned no data")
 
-            open_ = raw["Open"][C.JP_TICKERS]
-            close = raw["Close"][C.JP_TICKERS]
+            open_ = raw["Open"][tickers]
+            close = raw["Close"][tickers]
 
-            traded = close.notna().sum(axis=1) > len(C.JP_TICKERS) // 2
+            traded = close.notna().sum(axis=1) > len(tickers) // 2
             open_ = open_.loc[traded]
             close = close.loc[traded]
             if len(close) == 0:
-                raise RuntimeError("no Japanese trading days in the window")
+                raise RuntimeError(f"no {label} trading days in the window")
 
-            # Every TOPIX-17 ETF has been listed for the whole lookback,
-            # so a gap in the last few sessions means yfinance dropped a
-            # ticker rather than that the market was shut.
+            # Every ticker has been listed for the whole lookback, so a
+            # gap in the last few sessions means yfinance dropped a ticker
+            # rather than that the market was shut.
             recent = close.tail(5)
             gaps = list(recent.columns[recent.isna().any()])
             if gaps:
@@ -201,14 +220,14 @@ def fetch_jp_prices(lookback_days=200, retries=3, retry_delay=5):
         except Exception as e:
             last_err = e
             if attempt < retries:
-                print(f"[warn] yfinance JP fetch attempt {attempt}/{retries} "
-                      f"failed ({type(e).__name__}: {e}); retrying in "
-                      f"{delay}s.", file=sys.stderr)
+                print(f"[warn] yfinance {label} fetch attempt "
+                      f"{attempt}/{retries} failed ({type(e).__name__}: {e});"
+                      f" retrying in {delay}s.", file=sys.stderr)
                 time.sleep(delay)
                 delay *= 2
 
     raise RuntimeError(
-        f"yfinance JP fetch failed after {retries} attempts") from last_err
+        f"yfinance {label} fetch failed after {retries} attempts") from last_err
 
 
 def synthetic_window(seed=None, start_date="2010-01-01"):

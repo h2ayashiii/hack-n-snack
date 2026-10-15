@@ -4,11 +4,13 @@ daily_report.py
 Daily driver for the subspace-regularized PCA lead-lag model: build the
 signal for the latest U.S. close, render it, and deliver it.
 
-Designed to be run once per day from CI (see
-``.github/workflows/daily-signal.yml``) after the U.S. close and before
-the Japanese open, which is exactly the window the paper's timing
-convention targets: the U.S. close-to-close return on day *t* predicts
-the Japanese open-to-close return on day *t+1*.
+Designed to be run from CI (see ``.github/workflows/daily-signal.yml``)
+after the U.S. close and before the Japanese open, which is exactly the
+window the paper's timing convention targets: the U.S. close-to-close
+return on day *t* predicts the Japanese open-to-close return on day *t+1*.
+Scheduled runs pass ``--auto``: the target Tokyo session and the U.S.
+close it is built from come from the exchange calendars
+(``market_calendar.py``), and repeated runs deliver once per session.
 
 Two delivery channels are supported, selected independently of each
 other and of the underlying signal computation:
@@ -79,6 +81,7 @@ import numpy as np
 import pandas as pd
 
 import common as C
+import market_calendar as MC
 from realtime_run import (build_prior, ensure_output_dir, get_data,
                           save_chart_single, staleness_days)
 
@@ -96,7 +99,45 @@ def factor_name(s, k):
     labels = s.get("f_labels")
     return labels[k] if labels and k < len(labels) else f"factor {k + 1}"
 
+
+def jp_target(s) -> str:
+    """The Japanese session the book is for, when the calendar fixed it."""
+    jp = s.get("jp_session")
+    return f"JP session {pd.Timestamp(jp).date()}" if jp is not None \
+        else "next JP session"
+
+
 VALID_CHANNELS = {"email", "discord"}
+
+
+# ---------------------------------------------------------------------------
+# Signal row for the calendar's U.S. session
+# ---------------------------------------------------------------------------
+def rcc_through_us_session(rcc, us_session, us_close=None):
+    """Return ``rcc`` ending at ``us_session``, the day-t U.S. close.
+
+    ``rcc`` only holds days both markets traded.  When Tokyo was shut on
+    ``us_session`` (a Japanese holiday the U.S. traded) that day is not in
+    it, so a U.S.-only row is appended from ``us_close`` (a U.S.-only
+    close frame): the U.S. return since the last common day -- the same
+    span the next common-day row will carry -- with the Japanese block
+    NaN.  :func:`snapshot_at` reads only the U.S. block of day t, and
+    estimates on the L common days before it.
+
+    Raises ``LookupError`` when the U.S. close for ``us_session`` is not
+    available (yet).
+    """
+    us_session = pd.Timestamp(us_session)
+    if us_session in rcc.index:
+        return rcc.loc[:us_session]
+    if us_close is None or us_session not in us_close.index:
+        raise LookupError(f"no U.S. close for {us_session.date()} yet")
+    base = rcc.index[rcc.index < us_session][-1]
+    if base not in us_close.index:
+        raise LookupError(f"no U.S. close for the base day {base.date()}")
+    us_ret = us_close.loc[us_session] / us_close.loc[base] - 1.0
+    row = pd.DataFrame([us_ret.reindex(rcc.columns)], index=[us_session])
+    return pd.concat([rcc.loc[:base], row])
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +189,7 @@ def subject_line(s, perf=None) -> str:
     prefix = "[SYNTHETIC] " if not s["live"] else ""
     top_long = C.JP_TICKERS[longs[0]].replace(".T", "") if longs else "-"
     top_short = C.JP_TICKERS[shorts[0]].replace(".T", "") if shorts else "-"
-    return (f"{prefix}[Lead-Lag PCA_SUB] {date} signal -> next JP session"
+    return (f"{prefix}[Lead-Lag PCA_SUB] {date} signal -> {jp_target(s)}"
             f"  |  L:{len(longs)} S:{len(shorts)}"
             f"  top +{top_long} / -{top_short}")
 
@@ -161,7 +202,7 @@ def render_text(s, perf=None) -> str:
            line,
            f" signal day (t)   : {pd.Timestamp(s['signal_date']).date()}"
            f"  (U.S. close-to-close)",
-           f" predicting       : next Japanese open-to-close (t+1)",
+           f" predicting       : Japanese open-to-close, {jp_target(s)}",
            f" data source      : {s['source']}",
            f" params           : L={s['L']}  lambda={s['lam']}"
            f"  K={s['K']}  q={s['q']}"]
@@ -294,7 +335,7 @@ def render_html(s, perf=None, chart_cid=None) -> str:
 <h2 style="margin:0 0 4px">Lead-lag signal &mdash; {date}</h2>
 <p style="margin:0 0 16px;color:#57606a">
 U.S. close-to-close on <b>{date}</b> &rarr; predicted Japanese
-open-to-close for the <b>next JP session</b>.<br>
+open-to-close for the <b>{jp_target(s)}</b>.<br>
 Model: subspace-regularized PCA (PCA_SUB), L={s['L']},
 &lambda;={s['lam']}, K={s['K']}, q={s['q']}.<br>
 Data source: {s['source']}{universe}
@@ -491,7 +532,7 @@ def build_discord_payload(s, perf=None, attach_chart=False) -> dict:
 
     description = (
         f"U.S. close-to-close on **{date}** → predicted Japanese "
-        f"open-to-close for the **next JP session**.\n"
+        f"open-to-close for the **{jp_target(s)}**.\n"
         f"Model: PCA_SUB, L={s['L']}, λ={s['lam']}, K={s['K']}, "
         f"q={s['q']}\n"
         f"Data source: {s['source']}{universe_note}"
@@ -661,6 +702,19 @@ def main():
                          "two markets did not both trade, so re-mailing the "
                          "previous book would be misleading.  Ignored with "
                          "--date.  Default: -1 (never skip)")
+    ap.add_argument("--auto", action="store_true",
+                    help="scheduled mode: deliver only for a Tokyo session "
+                         "whose open is still ahead, built from the last "
+                         "U.S. close before it, once that close has "
+                         "settled; otherwise exit 0 without sending so a "
+                         "later run can retry (see market_calendar.py)")
+    ap.add_argument("--state-file", default=None,
+                    help="with --auto: JSON file recording the last Tokyo "
+                         "session delivered, so repeated runs send once")
+    ap.add_argument("--book-dir", default=None,
+                    help="with --auto: directory to save each delivered "
+                         "book in (one JSON per Tokyo session), which "
+                         "review_report.py --auto scores after the close")
     ap.add_argument("--trailing-days", type=int, default=20,
                     help="sessions of realised performance to include (0=off)")
     ap.add_argument("--L", type=int, default=60, help="estimation window")
@@ -677,10 +731,39 @@ def main():
 
     out_dir = ensure_output_dir(args.output_dir)
 
+    # --- schedule (--auto) ------------------------------------------------
+    plan = None
+    if args.auto:
+        if args.date:
+            ap.error("--auto picks the signal date itself; drop --date")
+        plan = MC.plan_delivery()
+        print(f"[plan] {plan.describe()}")
+        last = (MC.last_session(args.state_file)
+                if args.state_file else None)
+        if last is not None:
+            missed = MC.jp_sessions_between(last, plan.jp_session)
+            if missed:
+                print("::warning::no book was delivered before the open of "
+                      "JP session(s) "
+                      + ", ".join(str(d.date()) for d in missed))
+            if last >= plan.jp_session:
+                print(f"[skip] already delivered for JP session "
+                      f"{plan.jp_session.date()}.")
+                return 0
+        if not plan.ready:
+            print(f"[skip] U.S. close of {plan.us_session.date()} not "
+                  f"settled until {plan.ready_at:%Y-%m-%d %H:%M} UTC; a "
+                  f"later run will deliver.")
+            return 0
+
     # --- data -------------------------------------------------------------
     open_, close, source = get_data(args.prior_start,
                                     allow_network=not args.offline)
     live = source.startswith("yfinance")
+    if plan is not None and not live:
+        print(f"::warning::live data unavailable (source: {source}); "
+              f"nothing sent, a later run will retry.")
+        return 0
     if args.require_live and not live:
         print("[error] --require-live was set but live data is unavailable "
               f"(source: {source}); refusing to send a synthetic book.",
@@ -695,17 +778,40 @@ def main():
     # --- signal -----------------------------------------------------------
     from realtime_run import snapshot_at
 
+    rcc_sig = rcc
     signal_date = args.date or rcc.index[-1]
-    s = snapshot_at(rcc, C0, signal_date, source, L=args.L, lam=args.lam,
+    if plan is not None:
+        signal_date = plan.us_session
+        us_close = None
+        if plan.us_session not in rcc.index:
+            # Tokyo shut that day, or yfinance's joint download lacks it.
+            from realtime_run import fetch_us_prices
+            try:
+                us_close = fetch_us_prices()[1]
+            except Exception as e:
+                print(f"::warning::U.S.-only download failed "
+                      f"({type(e).__name__}: {e}); nothing sent.")
+                return 0
+        try:
+            rcc_sig = rcc_through_us_session(rcc, plan.us_session, us_close)
+        except LookupError as e:
+            print(f"[skip] {e} in yfinance; nothing sent, a later run "
+                  f"will retry.")
+            return 0
+
+    s = snapshot_at(rcc_sig, C0, signal_date, source, L=args.L, lam=args.lam,
                     K=args.K, q=args.q)
     s["live"] = live
+    if plan is not None:
+        assert s["signal_date"] == plan.us_session, s["signal_date"]
+        s["jp_session"] = plan.jp_session
 
     # cutoff_hour=20: the U.S. close (and thus the next fresh signal) can't
     # exist before ~20:00 UTC, so a run any time before that -- even one
     # GitHub delayed into the small hours of the next UTC day -- is still
     # scored against today's signal rather than being marked stale.
     stale = staleness_days(s["signal_date"], cutoff_hour=20)
-    if args.date is None and stale > 0:
+    if args.date is None and plan is None and stale > 0:
         print(f"[warn] latest available signal date is "
               f"{pd.Timestamp(s['signal_date']).date()}, {stale} day(s) old.",
               file=sys.stderr)
@@ -735,6 +841,7 @@ def main():
 
     # --- deliver ----------------------------------------------------------
     channels = resolve_channels(args)
+    delivered = False
 
     if "email" in channels:
         cfg = smtp_config(args)
@@ -752,6 +859,7 @@ def main():
             print(f"[dry-run] html preview written to {html}")
         else:
             send_message(msg, cfg)
+            delivered = True
             print(f"[sent] email: {msg['Subject']}")
             print(f"[sent] email to {', '.join(cfg['recipients'])} via "
                   f"{cfg['host']}:{cfg['port']}")
@@ -771,9 +879,19 @@ def main():
             print(f"[dry-run] discord payload written to {path}")
         else:
             post_discord(webhook, payload, chart_path)
+            delivered = True
             print(f"[sent] discord: {payload['embeds'][0]['title']} "
                   f"-> {mask_webhook(webhook)}")
 
+    if plan is not None and delivered and args.book_dir:
+        path = MC.save_book(args.book_dir, plan.jp_session, s, C.JP_TICKERS)
+        print(f"[state] book saved to {path}")
+    if plan is not None and delivered and args.state_file:
+        MC.record_sent(args.state_file, plan, s["signal_date"])
+        gh_out = os.environ.get("GITHUB_OUTPUT")
+        if gh_out:
+            with open(gh_out, "a", encoding="utf-8") as fh:
+                fh.write("sent=true\n")
     return 0
 
 

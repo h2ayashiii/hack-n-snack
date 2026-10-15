@@ -14,8 +14,10 @@ Timing (the paper's convention, eqs. 1-2):
     day t     U.S. close-to-close  ->  signal, published by daily_report.py
     day t+1   Japanese open-to-close  ->  realised, reviewed here
 
-so the natural schedule is just after 15:00 JST (06:00 UTC); see
-``.github/workflows/jp-close-review.yml``.
+so the natural schedule is just after the 15:30 JST (06:30 UTC) close;
+see ``.github/workflows/jp-close-review.yml``.  Scheduled runs pass
+``--auto``: they review only a session ``daily_report.py --auto``
+actually delivered a book for, and score that saved book as delivered.
 
 Delivery is shared with ``daily_report.py`` -- same channels, same
 configuration, same secrets:
@@ -58,6 +60,7 @@ from scipy.stats import spearmanr
 
 import common as C
 import daily_report as D
+import market_calendar as MC
 from realtime_run import (build_prior, ensure_output_dir, fetch_jp_prices,
                           get_data, snapshot_at, staleness_days)
 
@@ -121,6 +124,36 @@ def review_at(rcc, C0, jp_open, jp_close, review_date, source,
 
     s = snapshot_at(rcc, C0, signal_ts, source, L=L, lam=lam, K=K, q=q)
 
+    # The book is only "fresh" if this session is the first Japanese one
+    # after the signal.  When the U.S. was shut the day before (~8 times a
+    # year) no new book was published and yesterday's is simply carried.
+    later = jp_dates[jp_dates > signal_ts]
+    stale_book = bool(len(later)) and later[0] != review_ts
+
+    return score_book(s, jp_open, jp_close, review_ts, source,
+                      stale_book=stale_book)
+
+
+def review_saved_book(book, jp_open, jp_close, source):
+    """Score a book saved by ``daily_report.py --auto`` (the one actually
+    delivered for ``book["jp_session"]``) against that session."""
+    if list(book["tickers"]) != list(C.JP_TICKERS):
+        raise ValueError("saved book's tickers do not match JP_TICKERS")
+    review_ts = pd.Timestamp(book["jp_session"])
+    if review_ts not in jp_close.index:
+        raise KeyError(f"no Japanese prices for {review_ts.date()} yet")
+    s = dict(signal_date=pd.Timestamp(book["signal_date"]),
+             w=np.asarray(book["w"], dtype=float),
+             z_hat=np.asarray(book["z_hat"], dtype=float),
+             us_used=book.get("us_used") or C.US_TICKERS,
+             K=book["K"], lam=book["lam"], L=book["L"], q=book["q"])
+    return score_book(s, jp_open, jp_close, review_ts, source,
+                      stale_book=False)
+
+
+def score_book(s, jp_open, jp_close, review_ts, source, stale_book=False):
+    """Score book ``s`` (``w``, ``z_hat``, ``signal_date``, params)
+    against the realised Japanese session ``review_ts``."""
     o = jp_open.loc[review_ts, C.JP_TICKERS].to_numpy(dtype=float)
     c = jp_close.loc[review_ts, C.JP_TICKERS].to_numpy(dtype=float)
     if not (np.isfinite(o).all() and np.isfinite(c).all()):
@@ -138,12 +171,6 @@ def review_at(rcc, C0, jp_open, jp_close, review_date, source,
     book = np.concatenate([longs, shorts])
     hits = np.sign(w[book]) == np.sign(roc[book])
 
-    # The book is only "fresh" if this session is the first Japanese one
-    # after the signal.  When the U.S. was shut the day before (~8 times a
-    # year) no new book was published and yesterday's is simply carried.
-    later = jp_dates[jp_dates > signal_ts]
-    stale_book = bool(len(later)) and later[0] != review_ts
-
     return dict(
         review_date=review_ts, signal_date=s["signal_date"], source=source,
         stale_book=stale_book,
@@ -157,7 +184,8 @@ def review_at(rcc, C0, jp_open, jp_close, review_date, source,
         n_hits=int(hits.sum()), n_book=int(len(book)),
         ic=float(spearmanr(z, roc)[0]),
         longs=longs, shorts=shorts,
-        K=K, lam=lam, L=L, q=q, us_used=s.get("us_used", C.US_TICKERS),
+        K=s["K"], lam=s["lam"], L=s["L"], q=s["q"],
+        us_used=s.get("us_used", C.US_TICKERS),
     )
 
 
@@ -179,6 +207,27 @@ def review_history(rcc, C0, jp_open, jp_close, review_ts, source, days=20,
         except (ValueError, KeyError):
             continue
         rows.append((d, r["port_return"], r["hit_rate"]))
+    return _history_summary(rows)
+
+
+def saved_books_history(book_dir, jp_open, jp_close, review_ts, source,
+                        days=20):
+    """Trailing summary over the books actually delivered (``--auto``):
+    the last ``days`` saved books up to ``review_ts``, each scored against
+    its own session.  Same shape as :func:`review_history`."""
+    rows = []
+    for d in [d for d in MC.list_books(book_dir)
+              if d <= pd.Timestamp(review_ts)][-days:]:
+        book = MC.load_book(book_dir, d)
+        try:
+            r = review_saved_book(book, jp_open, jp_close, source)
+        except (ValueError, KeyError, TypeError):
+            continue
+        rows.append((d, r["port_return"], r["hit_rate"]))
+    return _history_summary(rows)
+
+
+def _history_summary(rows):
     if not rows:
         return None
     idx = pd.DatetimeIndex([r[0] for r in rows])
@@ -818,57 +867,10 @@ def save_calculator_html(r, path, hist=None):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser(
-        description="Post-close review of the lead-lag book")
-    ap.add_argument("--date", default=None,
-                    help="Japanese session to review (YYYY-MM-DD); "
-                         "default: the latest one available")
-    ap.add_argument("--channels", default=None,
-                    help="comma-separated delivery channels: email,discord "
-                         "(default: $REPORT_CHANNELS or 'email')")
-    ap.add_argument("--to", default=None,
-                    help=f"comma-separated recipients (default: $REPORT_TO or "
-                         f"the mock address {D.MOCK_ADDRESS})")
-    ap.add_argument("--sender", "--from", dest="sender", default=None,
-                    help=f"From address (default: $REPORT_FROM or "
-                         f"{D.MOCK_SENDER})")
-    ap.add_argument("--discord-webhook", default=None,
-                    help="Discord webhook URL (default: $DISCORD_WEBHOOK_URL)")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="render only; never open an SMTP connection or "
-                         "post to Discord")
-    ap.add_argument("--require-live", action="store_true",
-                    help="exit non-zero instead of falling back to synthetic "
-                         "data (use in production so no simulated result is "
-                         "ever sent out)")
-    ap.add_argument("--offline", action="store_true",
-                    help="skip the network and use the synthetic fallback")
-    ap.add_argument("--no-chart", action="store_true",
-                    help="do not render or attach the chart")
-    ap.add_argument("--no-calculator", action="store_true",
-                    help="do not render or attach the P&L calculator")
-    ap.add_argument("--skip-if-stale", type=int, default=-1, metavar="DAYS",
-                    help="exit 0 without sending when the latest Japanese "
-                         "session is more than DAYS calendar days old "
-                         "(0 = must be today, in JST).  Ignored with --date. "
-                         "Default: -1 (never skip)")
-    ap.add_argument("--history-days", type=int, default=20,
-                    help="reviewed sessions to summarise (0=off)")
-    ap.add_argument("--L", type=int, default=60, help="estimation window")
-    ap.add_argument("--lam", type=float, default=0.9, help="shrinkage lambda")
-    ap.add_argument("--K", type=int, default=3, help="number of factors")
-    ap.add_argument("--q", type=float, default=0.3, help="long/short quantile")
-    ap.add_argument("--prior-start", default="2010-01-01",
-                    help="download start and beginning of the prior window")
-    ap.add_argument("--prior-end", default="2014-12-31",
-                    help="end of prior training window")
-    ap.add_argument("--output-dir", default="output",
-                    help="directory for charts and dry-run output")
-    args = ap.parse_args()
-
-    out_dir = ensure_output_dir(args.output_dir)
-
+def _review_latest(args):
+    """Manual/legacy path: recompute the book and review the latest
+    (or ``--date``) Japanese session.  Returns ``(r, hist)`` or an exit
+    code."""
     # --- data -------------------------------------------------------------
     open_, close, source = get_data(args.prior_start,
                                     allow_network=not args.offline)
@@ -922,6 +924,120 @@ def main():
         except Exception as e:  # never let the extras block the report
             print(f"[warn] trailing review history unavailable "
                   f"({type(e).__name__}: {e})", file=sys.stderr)
+    return r, hist
+
+
+def _review_delivered(args):
+    """``--auto`` path: review the latest Tokyo session that has closed,
+    scoring the book ``daily_report.py --auto`` actually delivered for it,
+    and only if one was.  Returns ``(r, hist)`` or an exit code."""
+    session, closed = MC.latest_closed_jp_session()
+    print(f"[plan] review JP session {session.date()} (closed "
+          f"{closed:%Y-%m-%d %H:%M} UTC)")
+    last = MC.last_session(args.state_file) if args.state_file else None
+    if last is not None and last >= session:
+        print(f"[skip] already reviewed JP session {session.date()}.")
+        return 0
+    book = MC.load_book(args.book_dir, session)
+    if book is None:
+        print(f"[skip] no book was delivered for JP session "
+              f"{session.date()}; nothing to review.")
+        return 0
+    if args.offline:
+        print("[skip] --offline: no live Japanese prices to review against.")
+        return 0
+
+    source = "yfinance (live market data)"
+    try:
+        jp_open, jp_close = fetch_jp_prices()
+        r = review_saved_book(book, jp_open, jp_close, source)
+    except (KeyError, ValueError) as e:
+        print(f"[skip] {e}; nothing sent, a later run will retry.")
+        return 0
+    except Exception as e:
+        print(f"::warning::Japan-only download failed "
+              f"({type(e).__name__}: {e}); nothing sent.")
+        return 0
+    r["live"] = True
+
+    hist = None
+    if args.history_days > 0:
+        hist = saved_books_history(args.book_dir, jp_open, jp_close, session,
+                                   source, days=args.history_days)
+    return r, hist
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Post-close review of the lead-lag book")
+    ap.add_argument("--date", default=None,
+                    help="Japanese session to review (YYYY-MM-DD); "
+                         "default: the latest one available")
+    ap.add_argument("--channels", default=None,
+                    help="comma-separated delivery channels: email,discord "
+                         "(default: $REPORT_CHANNELS or 'email')")
+    ap.add_argument("--to", default=None,
+                    help=f"comma-separated recipients (default: $REPORT_TO or "
+                         f"the mock address {D.MOCK_ADDRESS})")
+    ap.add_argument("--sender", "--from", dest="sender", default=None,
+                    help=f"From address (default: $REPORT_FROM or "
+                         f"{D.MOCK_SENDER})")
+    ap.add_argument("--discord-webhook", default=None,
+                    help="Discord webhook URL (default: $DISCORD_WEBHOOK_URL)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="render only; never open an SMTP connection or "
+                         "post to Discord")
+    ap.add_argument("--require-live", action="store_true",
+                    help="exit non-zero instead of falling back to synthetic "
+                         "data (use in production so no simulated result is "
+                         "ever sent out)")
+    ap.add_argument("--offline", action="store_true",
+                    help="skip the network and use the synthetic fallback")
+    ap.add_argument("--no-chart", action="store_true",
+                    help="do not render or attach the chart")
+    ap.add_argument("--no-calculator", action="store_true",
+                    help="do not render or attach the P&L calculator")
+    ap.add_argument("--skip-if-stale", type=int, default=-1, metavar="DAYS",
+                    help="exit 0 without sending when the latest Japanese "
+                         "session is more than DAYS calendar days old "
+                         "(0 = must be today, in JST).  Ignored with --date. "
+                         "Default: -1 (never skip)")
+    ap.add_argument("--auto", action="store_true",
+                    help="scheduled mode: review the latest Tokyo session "
+                         "that has closed, scoring the book delivered for "
+                         "it (from --book-dir); exit 0 without sending when "
+                         "no book was delivered for it, or it was already "
+                         "reviewed (see market_calendar.py)")
+    ap.add_argument("--book-dir", default=None,
+                    help="with --auto: where daily_report.py --auto saved "
+                         "the delivered books")
+    ap.add_argument("--state-file", default=None,
+                    help="with --auto: JSON file recording the last Tokyo "
+                         "session reviewed, so repeated runs send once")
+    ap.add_argument("--history-days", type=int, default=20,
+                    help="reviewed sessions to summarise (0=off)")
+    ap.add_argument("--L", type=int, default=60, help="estimation window")
+    ap.add_argument("--lam", type=float, default=0.9, help="shrinkage lambda")
+    ap.add_argument("--K", type=int, default=3, help="number of factors")
+    ap.add_argument("--q", type=float, default=0.3, help="long/short quantile")
+    ap.add_argument("--prior-start", default="2010-01-01",
+                    help="download start and beginning of the prior window")
+    ap.add_argument("--prior-end", default="2014-12-31",
+                    help="end of prior training window")
+    ap.add_argument("--output-dir", default="output",
+                    help="directory for charts and dry-run output")
+    args = ap.parse_args()
+
+    if args.auto and args.date:
+        ap.error("--auto picks the session itself; drop --date")
+    if args.auto and not args.book_dir:
+        ap.error("--auto needs --book-dir")
+    out_dir = ensure_output_dir(args.output_dir)
+
+    res = _review_delivered(args) if args.auto else _review_latest(args)
+    if isinstance(res, int):
+        return res
+    r, hist = res
 
     d_str = str(pd.Timestamp(r["review_date"]).date())
 
@@ -937,6 +1053,7 @@ def main():
 
     # --- deliver ----------------------------------------------------------
     channels = D.resolve_channels(args)
+    delivered = False
 
     if "email" in channels:
         cfg = D.smtp_config(args)
@@ -967,6 +1084,7 @@ def main():
             print(f"[dry-run] html preview written to {html}")
         else:
             D.send_message(msg, cfg)
+            delivered = True
             print(f"[sent] email: {msg['Subject']}")
             print(f"[sent] email to {', '.join(cfg['recipients'])} via "
                   f"{cfg['host']}:{cfg['port']}")
@@ -997,9 +1115,17 @@ def main():
                     extra_files = [(f"review_calc_{d_str}.html", "text/html",
                                     fh.read())]
             D.post_discord(webhook, payload, chart_path, extra_files=extra_files)
+            delivered = True
             print(f"[sent] discord: {payload['embeds'][0]['title']} "
                   f"-> {D.mask_webhook(webhook)}")
 
+    if args.auto and delivered and args.state_file:
+        MC.record_session(args.state_file, r["review_date"],
+                          signal_date=pd.Timestamp(r["signal_date"]).date())
+        gh_out = os.environ.get("GITHUB_OUTPUT")
+        if gh_out:
+            with open(gh_out, "a", encoding="utf-8") as fh:
+                fh.write("sent=true\n")
     return 0
 
 

@@ -7,31 +7,25 @@ name: JP close review
 #
 # Timing follows the same convention: the U.S. close-to-close return on day
 # t predicts the Japanese open-to-close return on day t+1, so the review has
-# to land after the Japanese close.
+# to land after the Japanese close (15:30 JST = 06:30 UTC).
 #
-#   07:00 UTC  =  16:00 JST  -- 1h after the Japanese close (06:00 UTC),
-#                               enough slack for Yahoo Finance to settle the
-#                               daily bars
-#              =  03:00 ET   -- well before the next U.S. open, so the
-#                               signal job's data is untouched
+# Like the signal job, GitHub's cron fires this job hours late, so it is
+# armed every 30 minutes from 07:17 to 12:47 UTC and review_report.py
+# --auto decides what each run does (market_calendar.py):
 #
-# The Japanese session being reviewed is not yet a day both markets traded
-# (the U.S. has not closed), so review_report.py lays a Japan-only download
-# over the joint frames to pick it up.
+#   * the target is the latest Tokyo session that closed >= 30 min ago;
+#   * it is reviewed only if daily-signal.yml actually delivered a book
+#     for it -- that saved book (state/books/, restored read-only from the
+#     signal job's cache) is scored as delivered, not recomputed.  No book
+#     (a holiday, or a day the signal missed the open) -> nothing is sent;
+#   * a session already reviewed (this job's own cache) is not re-sent.
 #
-# GitHub only guarantees best-effort scheduling and can delay cron runs by
-# several minutes to over an hour at peak times.  Note also that GitHub
-# disables scheduled workflows in a repository with no activity for 60 days;
-# push a commit or re-enable it from the Actions tab.
-#
-# This job is OFF by default: the scheduled (cron) trigger is a no-op
-# unless the repo variable ENABLE_JP_CLOSE_REVIEW is set to "true"
-# (Settings -> Secrets and variables -> Actions -> Variables). A manual
-# workflow_dispatch run always runs regardless of the variable.
+# Note also that GitHub disables scheduled workflows in a repository with no
+# activity for 60 days; push a commit or re-enable it from the Actions tab.
 
 on:
   schedule:
-    - cron: "0 7 * * 1-5"
+    - cron: "17,47 7-12 * * 1-5"
   workflow_dispatch:
     inputs:
       date:
@@ -52,6 +46,11 @@ on:
         description: "Delivery channels, comma-separated (email, discord). Empty = repo default (REPORT_CHANNELS variable, or 'discord' for this workflow)."
         required: false
         type: string
+      auto:
+        description: "Behave like a scheduled run (review only a delivered book, once). Ignores 'date'."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -62,10 +61,6 @@ concurrency:
 
 jobs:
   review:
-    # Default-off: a scheduled run is skipped unless ENABLE_JP_CLOSE_REVIEW
-    # is explicitly set to "true" as a repo variable. workflow_dispatch
-    # always runs, since triggering it by hand is already an explicit ask.
-    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_JP_CLOSE_REVIEW == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -84,16 +79,36 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra live --frozen
 
+      - name: Restore delivered books (signal job's state, read-only)
+        uses: actions/cache/restore@v4
+        with:
+          path: lead_lag_strategy_v2/state
+          key: daily-signal-state-${{ github.run_id }}
+          restore-keys: daily-signal-state-
+
+      - name: Restore review state
+        uses: actions/cache/restore@v4
+        with:
+          path: lead_lag_strategy_v2/review_state
+          key: jp-close-review-state-${{ github.run_id }}
+          restore-keys: jp-close-review-state-
+
       - name: Build flags
         id: flags
         env:
+          IS_SCHEDULE: ${{ github.event_name == 'schedule' }}
+          IN_AUTO: ${{ inputs.auto }}
           IN_DATE: ${{ inputs.date }}
           IN_DRY: ${{ inputs.dry_run }}
           IN_OFFLINE: ${{ inputs.offline }}
           IN_CHANNELS: ${{ inputs.channels }}
         run: |
           flags=""
-          if [ -n "$IN_DATE" ]; then flags="$flags --date $IN_DATE"; fi
+          if [ "$IS_SCHEDULE" = "true" ] || [ "$IN_AUTO" = "true" ]; then
+            flags="$flags --auto --book-dir state/books --state-file review_state/last_reviewed.json"
+          elif [ -n "$IN_DATE" ]; then
+            flags="$flags --date $IN_DATE"
+          fi
           if [ "$IN_DRY" = "true" ]; then flags="$flags --dry-run"; fi
           if [ -n "$IN_CHANNELS" ]; then flags="$flags --channels $IN_CHANNELS"; fi
           if [ "$IN_OFFLINE" = "true" ]; then
@@ -101,18 +116,14 @@ jobs:
             # since simulated prices are never "today's market".
             flags="$flags --offline"
           fi
-          # No --require-live / --skip-if-stale here: this workflow must
-          # send every scheduled weekday run unconditionally, even if
-          # yfinance's daily bar for today's Japanese close hasn't settled
-          # yet by run time (in which case the latest available session,
-          # and the review, simply repeats the prior one; review_report.py
-          # already flags this via stale_book) or live data is unavailable
-          # (in which case get_data() falls back to a synthetic window and
-          # the report says so).
+          # With --auto, a run with no delivered book for the session, no
+          # live prices, or the session's bars not yet in yfinance sends
+          # nothing and leaves it to a later run.
           echo "flags=$flags" >> "$GITHUB_OUTPUT"
           echo "Using flags:$flags"
 
       - name: Score the book against the Japanese close
+        id: review
         env:
           # Which channels to use when --channels wasn't passed above.
           # Same convention as daily-signal.yml: this workflow is deployed
@@ -130,6 +141,13 @@ jobs:
           REPORT_TO: ${{ vars.REPORT_TO }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: uv run python review_report.py ${{ steps.flags.outputs.flags }}
+
+      - name: Save review state
+        if: steps.review.outputs.sent == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: lead_lag_strategy_v2/review_state
+          key: jp-close-review-state-${{ github.run_id }}
 
       - name: Upload rendered review
         if: always()

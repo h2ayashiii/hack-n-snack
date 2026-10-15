@@ -711,6 +711,10 @@ def main():
     ap.add_argument("--state-file", default=None,
                     help="with --auto: JSON file recording the last Tokyo "
                          "session delivered, so repeated runs send once")
+    ap.add_argument("--book-dir", default=None,
+                    help="with --auto: directory to save each delivered "
+                         "book in (one JSON per Tokyo session), which "
+                         "review_report.py --auto scores after the close")
     ap.add_argument("--trailing-days", type=int, default=20,
                     help="sessions of realised performance to include (0=off)")
     ap.add_argument("--L", type=int, default=60, help="estimation window")
@@ -734,7 +738,7 @@ def main():
             ap.error("--auto picks the signal date itself; drop --date")
         plan = MC.plan_delivery()
         print(f"[plan] {plan.describe()}")
-        last = (MC.last_sent_session(args.state_file)
+        last = (MC.last_session(args.state_file)
                 if args.state_file else None)
         if last is not None:
             missed = MC.jp_sessions_between(last, plan.jp_session)
@@ -879,6 +883,9 @@ def main():
             print(f"[sent] discord: {payload['embeds'][0]['title']} "
                   f"-> {mask_webhook(webhook)}")
 
+    if plan is not None and delivered and args.book_dir:
+        path = MC.save_book(args.book_dir, plan.jp_session, s, C.JP_TICKERS)
+        print(f"[state] book saved to {path}")
     if plan is not None and delivered and args.state_file:
         MC.record_sent(args.state_file, plan, s["signal_date"])
         gh_out = os.environ.get("GITHUB_OUTPUT")

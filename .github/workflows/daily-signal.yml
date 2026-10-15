@@ -24,6 +24,9 @@ name: Daily lead-lag signal
 #     was already delivered (state kept in the Actions cache), exit
 #     without sending.
 #
+# Each delivered book is saved under state/books/ in the same cache, and
+# jp-close-review.yml scores exactly that book after the Japanese close.
+#
 # Note also that GitHub disables scheduled workflows in a repository with no
 # activity for 60 days; push a commit or re-enable it from the Actions tab.
 
@@ -102,7 +105,7 @@ jobs:
         run: |
           flags=""
           if [ "$IS_SCHEDULE" = "true" ] || [ "$IN_AUTO" = "true" ]; then
-            flags="$flags --auto --state-file state/last_sent.json"
+            flags="$flags --auto --state-file state/last_sent.json --book-dir state/books"
           elif [ -n "$IN_DATE" ]; then
             flags="$flags --date $IN_DATE"
           fi

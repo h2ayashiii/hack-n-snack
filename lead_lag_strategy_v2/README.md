@@ -207,7 +207,7 @@ MDD -9.58% と、リスク調整後リターンと最大ドローダウンの両
 | `daily_report.py` | **日次レポート**: シグナルをメール（HTML/テキスト、SMTP）と Discord（Embed、Webhook）のどちらか／両方で配信（第5節） |
 | `review_report.py` | **クローズ後レポート**: 日本市場の引け後に、配信済みの建玉が実際にどうなったか（円・％・寄与・当否）を同じチャネルで配信（第6節） |
 | `../.github/workflows/daily-signal.yml` | **日次自動実行**: GitHub Actions の cron で毎営業日 `daily_report.py` を実行（日本オープン前） |
-| `../.github/workflows/jp-close-review.yml` | **クローズ後自動実行（デフォルト無効）**: GitHub Actions の cron で毎営業日 `review_report.py` を実行（日本クローズ後）。`ENABLE_JP_CLOSE_REVIEW` リポジトリ変数を `true` にするまでスケジュール実行はスキップされる |
+| `../.github/workflows/jp-close-review.yml` | **クローズ後自動実行**: 日本クローズ後に `review_report.py --auto` を実行。その日に配信した建玉があるときだけ予実を配信 |
 | `output/` | 生成されるチャート・図の出力先（git 管理外） |
 | `README.md` | 本ファイル |
 
@@ -579,10 +579,17 @@ POST し、JSON の Embed（`payload_json`）とチャート画像（`files[0]`�
 上書きし、直近セッションを復元します。この追加取得も `threads=False` +
 リトライで、5.6節と同じ yfinance の sqlite ロック問題を回避しています。
 
-採点対象セッションに対するシグナル日は「その日より**厳密に前**の直近の
-日米共通営業日」＝ `daily_report.py` が実際に配信した建玉です。米国が前日
-休場だった場合（年8回程度）は新しいシグナルが発行されていないため、前日の
-建玉を持ち越したものとして採点し、レポートに明示的な注記が入ります。
+スケジュール実行（`--auto`）では、`daily_report.py --auto` が**実際に配信した
+建玉**を `state/books/<東証営業日>.json` に保存し、`review_report.py --auto` は
+その保存済みの建玉をそのまま採点します（計算し直さないため、日本の祝日明けに
+米国のみの取引日のデータで作った建玉も、配信内容どおりに採点されます）。
+**その日に建玉が配信されていなければ予実レポートは出しません**（東証の休場日、
+予測がオープンに間に合わなかった日など）。直近の推移（`--history-days`）も
+保存済みの配信建玉だけで集計します。
+
+手動実行（`--auto` なし）は従来どおり、採点対象セッションより**厳密に前**の
+直近の日米共通営業日のデータから建玉を計算し直して採点します。米国が前日
+休場だった場合は前日の建玉を持ち越したものとして注記が入ります。
 
 ### 6.2 配信内容
 
@@ -618,30 +625,27 @@ python review_report.py --channels discord
 
 ### 6.4 GitHub Actions による自動実行
 
-`.github/workflows/jp-close-review.yml` が `cron: "0 7 * * 1-5"`（UTC）で
-毎営業日実行します。
+`.github/workflows/jp-close-review.yml` が `cron: "17,47 7-12 * * 1-5"`（UTC）で
+日本クローズ（15:30 JST = 06:30 UTC）の後、30分おきに起動します（GitHub の
+cron が数時間遅れることがあるため）。各回は `review_report.py --auto` が
+次のように判定します。
 
-```
-07:00 UTC = 16:00 JST  … 日本クローズ（15:00 JST）の1時間後
-          = 03:00 ET   … 次の米国オープンより十分前
-```
+- **採点対象**: 引けから30分以上経った直近の東証営業日（東証カレンダー）。
+- **配信条件**: 日次シグナル側がその営業日向けの建玉を配信済みであること。
+  配信済みの建玉は日次シグナル側の Actions キャッシュ（`state/books/`）を
+  読み取り専用で復元して参照します。建玉がなければ何も送らずに終了します。
+- **1日1回**: 採点済みの営業日を本ワークフロー専用のキャッシュ
+  （`review_state/last_reviewed.json`）に記録し、以降の回はスキップします。
+- yfinance に当日の日本の引け値がまだない回、取得に失敗した回は送らずに
+  終了し、次の回に任せます。
 
 日次シグナル側（`daily-signal.yml`）と同じ Secrets / Variables をそのまま
 使うため、配信自体に追加の設定は不要です（`DISCORD_WEBHOOK_URL` を設定済み
 なら動きます）。チャネル未指定時の既定が `discord` である点も同じです。
-
-**このワークフローはデフォルトで無効（OFF）です。** cron によるスケジュール
-実行は、リポジトリ変数 `ENABLE_JP_CLOSE_REVIEW` を `true` に設定するまで
-何も行いません（`workflow_dispatch` による手動実行は変数の値に関わらず常に
-動きます）。有効化するには GitHub の
-Settings → Secrets and variables → Actions → Variables で
-`ENABLE_JP_CLOSE_REVIEW=true` を追加してください。
-
-有効化されている場合、スケジュール実行は `--require-live` / `--skip-if-stale`
-を付けずに毎回必ず配信します（日本市場が休場だった日は前回セッションの
-持ち越し採点、ライブ取得に失敗した場合は synthetic データとして、いずれも
-その旨を明示した上で送信されます）。生成物は Artifacts
-（`jp-close-review-<run_id>`、保持30日）へアップロードされます。
+以前あった `ENABLE_JP_CLOSE_REVIEW` 変数による停止は廃止しました（建玉が
+配信された日だけ動くため不要）。手動実行では `auto` をオンにするとスケジュール
+実行と同じ判定で動き、オフなら従来どおり最新セッションを計算し直して採点します。
+生成物は Artifacts（`jp-close-review-<run_id>`、保持30日）へアップロードされます。
 
 ---
 

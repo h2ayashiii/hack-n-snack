@@ -20,6 +20,11 @@ the two real exchange calendars (``XNYS`` and ``XTKS`` from
   still-trading intraday bar is never mistaken for the daily close.
 
 DST and early closes come from the calendars themselves.
+
+The post-close review (``review_report.py --auto``) uses the same
+calendars the other way round: it reviews the latest Tokyo session that
+has closed, and only if a book was actually delivered for it (the books
+are saved here by the signal job, see :func:`save_book`).
 """
 
 from __future__ import annotations
@@ -34,6 +39,8 @@ import pandas as pd
 JP_CALENDAR = "XTKS"
 US_CALENDAR = "XNYS"
 DEFAULT_SETTLE = dt.timedelta(minutes=15)
+REVIEW_SETTLE = dt.timedelta(minutes=30)
+BOOKS_KEPT = 60
 
 
 @dataclass(frozen=True)
@@ -89,10 +96,25 @@ def plan_delivery(now=None, settle: dt.timedelta = DEFAULT_SETTLE
                         ready_at=us_close + settle)
 
 
+def latest_closed_jp_session(now=None, settle: dt.timedelta = REVIEW_SETTLE
+                             ) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """The latest Tokyo session closed at least ``settle`` before ``now``.
+
+    Returns ``(session, close_utc)``.
+    """
+    now = _utc(now if now is not None else dt.datetime.now(dt.timezone.utc))
+    jp, _ = _calendars()
+    day = now.tz_convert(None).normalize()
+    sessions = jp.sessions_in_range(day - pd.Timedelta(days=21), day)
+    session = [s for s in sessions if jp.session_close(s) + settle <= now][-1]
+    return session, jp.session_close(session)
+
+
 # ---------------------------------------------------------------------------
-# "Already sent" state, persisted between runs by the workflow's cache
+# Delivery / review state, persisted between runs by the workflow cache
 # ---------------------------------------------------------------------------
-def last_sent_session(path: str) -> pd.Timestamp | None:
+def last_session(path: str) -> pd.Timestamp | None:
+    """The ``jp_session`` recorded in a state file, if any."""
     try:
         with open(path, encoding="utf-8") as fh:
             return pd.Timestamp(json.load(fh)["jp_session"])
@@ -100,14 +122,69 @@ def last_sent_session(path: str) -> pd.Timestamp | None:
         return None
 
 
-def record_sent(path: str, plan: DeliveryPlan, signal_date) -> None:
+def record_session(path: str, jp_session, **extra) -> None:
+    """Record ``jp_session`` (plus ``extra`` fields) as done in ``path``."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    rec = {"jp_session": str(pd.Timestamp(jp_session).date())}
+    rec.update({k: str(v) for k, v in extra.items()})
+    rec["at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"jp_session": str(plan.jp_session.date()),
-                   "us_session": str(plan.us_session.date()),
-                   "signal_date": str(pd.Timestamp(signal_date).date()),
-                   "sent_at": dt.datetime.now(dt.timezone.utc).isoformat()},
-                  fh, indent=2)
+        json.dump(rec, fh, indent=2)
+
+
+def record_sent(path: str, plan: DeliveryPlan, signal_date) -> None:
+    record_session(path, plan.jp_session,
+                   us_session=plan.us_session.date(),
+                   signal_date=pd.Timestamp(signal_date).date())
+
+
+# The delivered books themselves, one JSON file per Tokyo session, so the
+# post-close review scores exactly what was sent rather than recomputing.
+def _book_path(book_dir: str, jp_session) -> str:
+    return os.path.join(book_dir, f"{pd.Timestamp(jp_session).date()}.json")
+
+
+def save_book(book_dir: str, jp_session, s: dict, tickers) -> str:
+    """Save the delivered snapshot ``s`` as the book for ``jp_session``."""
+    os.makedirs(book_dir, exist_ok=True)
+    book = {"jp_session": str(pd.Timestamp(jp_session).date()),
+            "signal_date": str(pd.Timestamp(s["signal_date"]).date()),
+            "tickers": list(tickers),
+            "w": [float(x) for x in s["w"]],
+            "z_hat": [float(x) for x in s["z_hat"]],
+            "us_used": list(s.get("us_used", [])),
+            "source": s["source"],
+            "L": s["L"], "lam": s["lam"], "K": s["K"], "q": s["q"]}
+    path = _book_path(book_dir, jp_session)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(book, fh, indent=2)
+    for old in list_books(book_dir)[:-BOOKS_KEPT]:
+        os.remove(_book_path(book_dir, old))
+    return path
+
+
+def load_book(book_dir: str, jp_session) -> dict | None:
+    try:
+        with open(_book_path(book_dir, jp_session), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def list_books(book_dir: str) -> list[pd.Timestamp]:
+    """Sessions with a saved book, oldest first."""
+    try:
+        names = os.listdir(book_dir)
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        if n.endswith(".json"):
+            try:
+                out.append(pd.Timestamp(n[:-5]))
+            except ValueError:
+                pass
+    return sorted(out)
 
 
 def jp_sessions_between(after, before) -> list[pd.Timestamp]:

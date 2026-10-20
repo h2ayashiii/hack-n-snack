@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 import os
 import sys
 
@@ -241,6 +240,35 @@ def _history_summary(rows):
                 first=idx[0], last=idx[-1])
 
 
+# Fixed example sizes for the yen P&L shown in every review.  Each amount
+# is put on *both* legs -- bought across the longs and sold short across
+# the shorts, split equally by name -- which is the book the return above
+# describes (sum w = 0, sum |w| = 2), so P&L = amount x book return.
+PNL_AMOUNTS = (10_000, 100_000, 1_000_000)
+
+
+def pnl_by_amount(r, amounts=PNL_AMOUNTS):
+    """Yen P&L of the reviewed session for each amount per leg.
+
+    Theoretical: fractional units at the open and close, no costs,
+    slippage or borrow fees.  Each figure is rounded to the yen on its
+    own, so long + short can differ from the total by ¥1.
+    """
+    long_ret = float(r["contrib"][r["longs"]].sum())     # = long leg
+    short_ret = float(r["contrib"][r["shorts"]].sum())   # = -short leg
+    return [dict(amount=a, long=round(a * long_ret),
+                 short=round(a * short_ret),
+                 total=round(a * r["port_return"])) for a in amounts]
+
+
+def _yen(x, signed=True):
+    if x == 0:
+        return "¥0"
+    if not signed:
+        return f"¥{x:,}"
+    return f"{'+' if x > 0 else '-'}¥{abs(x):,}"
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -304,6 +332,13 @@ def render_text(r, hist=None) -> str:
             f"  ({100 * r['hit_rate']:.0f}%)",
             f"   rank IC       : {r['ic']:+.3f}"
             f"   (Spearman, zhat vs realised)"]
+
+    out += ["", " P&L BY AMOUNT (amount bought long + same amount sold short)",
+            f"   {'amount':>12s} {'long':>12s} {'short':>12s} {'total':>12s}"]
+    for p in pnl_by_amount(r):
+        out.append(f"   {_yen(p['amount'], signed=False):>12s}"
+                   f" {_yen(p['long']):>12s} {_yen(p['short']):>12s}"
+                   f" {_yen(p['total']):>12s}")
 
     hdr = (f"   {'ETF':<8s} {'sector':<30s} {'zhat':>7s} {'open':>9s}"
            f" {'close':>9s} {'chg':>8s} {'%':>8s} {'contrib':>8s}  hit")
@@ -436,6 +471,30 @@ def render_html(r, hist=None, chart_cid=None) -> str:
             f'Short leg <code>{100 * r["short_leg"]:+.3f}%</code> &nbsp;&nbsp; '
             f'Book return = long &minus; short.</p>')
 
+    def yen_td(x, signed=True, bold=False):
+        colour = ("#1f2328" if not signed else "#1a7f37" if x > 0
+                  else "#c11d2b" if x < 0 else "#57606a")
+        weight = ";font-weight:600" if bold else ""
+        return (f'<td style="{_TD};text-align:right;font-family:monospace;'
+                f'color:{colour}{weight}">{_yen(x, signed)}</td>')
+
+    pnl_html = (
+        '<h3 style="margin:24px 0 8px">P&amp;L by amount</h3>'
+        '<table style="border-collapse:collapse;font-size:14px"><tr>'
+        f'<th style="{th};text-align:right">AMOUNT</th>'
+        f'<th style="{th};text-align:right">LONG</th>'
+        f'<th style="{th};text-align:right">SHORT</th>'
+        f'<th style="{th};text-align:right">TOTAL</th></tr>'
+        + "".join('<tr>' + yen_td(p["amount"], signed=False)
+                  + yen_td(p["long"]) + yen_td(p["short"])
+                  + yen_td(p["total"], bold=True) + '</tr>'
+                  for p in pnl_by_amount(r))
+        + '</table>'
+        '<p style="color:#57606a;font-size:13px">The amount is bought '
+        'across the longs and the same amount sold short across the shorts, '
+        'equal weight by name, at the open and closed at the close. '
+        'Fractional units, no costs, slippage or borrow fees.</p>')
+
     hist_html = ""
     if hist:
         hist_html = (
@@ -483,6 +542,7 @@ Data source: {r['source']}
 {banner}
 {headline}
 {legs}
+{pnl_html}
 <h3 style="margin:24px 0 8px">The book</h3>
 <table style="border-collapse:collapse;width:100%;font-size:14px">
 {cols}
@@ -560,6 +620,13 @@ def build_discord_payload(r, hist=None, attach_chart=False) -> dict:
          "value": _discord_side_field(longs, r), "inline": False},
         {"name": f"\U0001F534 SHORT ({len(shorts)})",
          "value": _discord_side_field(shorts, r), "inline": False},
+        {"name": "\U0001F4B4 P&L by amount (long + same amount short)",
+         "value": "\n".join(
+             f"`{_yen(p['amount'], signed=False):>10s}` → "
+             f"**`{_yen(p['total']):>9s}`**  "
+             f"(long `{_yen(p['long'])}` / short `{_yen(p['short'])}`)"
+             for p in pnl_by_amount(r)),
+         "inline": False},
     ]
     if hist:
         fields.append({
@@ -582,7 +649,9 @@ def build_discord_payload(r, hist=None, attach_chart=False) -> dict:
         "color": colour,
         "fields": fields,
         "footer": {"text": "% is open-to-close; the second column is the "
-                           "move in yen. Research output only -- not "
+                           "move in yen per unit. P&L: equal weight by "
+                           "name, open to close, fractional units, no costs "
+                           "or borrow fees. Research output only -- not "
                            "investment advice."},
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
@@ -608,14 +677,15 @@ def save_review_chart(r, path, hist=None):
     colours = ["#d62728" if r["w"][i] < 0 else
                ("#2ca02c" if r["w"][i] > 0 else "#bbbbbb") for i in order]
 
-    nrows = 2 if hist is not None and hist["n"] > 1 else 1
-    fig = plt.figure(figsize=(12, 7.5 if nrows == 1 else 10))
+    with_hist = hist is not None and hist["n"] > 1
+    fig = plt.figure(figsize=(12, 12 if with_hist else 9.5))
     # explicit margins rather than tight_layout: the two top panels share a
     # y axis whose tick labels only exist on the left one, which tight_layout
     # cannot balance.
-    gs = fig.add_gridspec(nrows, 2, height_ratios=[3, 1][:nrows], hspace=0.32,
-                          wspace=0.05, left=0.20, right=0.98, top=0.90,
-                          bottom=0.06 if nrows == 1 else 0.10)
+    gs = fig.add_gridspec(3 if with_hist else 2, 2,
+                          height_ratios=[3, 0.65, 1][:3 if with_hist else 2],
+                          hspace=0.32, wspace=0.05, left=0.20, right=0.98,
+                          top=0.92, bottom=0.08 if with_hist else 0.03)
 
     ax0 = fig.add_subplot(gs[0, 0])
     ax0.barh(range(len(order)), r["z_hat"][order], color=colours)
@@ -659,8 +729,10 @@ def save_review_chart(r, path, hist=None):
                         Patch(facecolor="#bbbbbb", label="neutral")],
                loc="lower right", fontsize=8)
 
-    if nrows == 2:
-        ax2 = fig.add_subplot(gs[1, :])
+    _pnl_table(fig.add_subplot(gs[1, :]), r)
+
+    if with_hist:
+        ax2 = fig.add_subplot(gs[2, :])
         curve = 100 * ((1.0 + hist["returns"]).cumprod() - 1.0)
         ax2.plot(curve.index, curve.values, color="#2f6feb", lw=1.6,
                  marker="o", ms=3)
@@ -680,188 +752,33 @@ def save_review_chart(r, path, hist=None):
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# P&L calculator (standalone HTML, vanilla JS)
-# ---------------------------------------------------------------------------
-def _calculator_data(r, hist=None) -> dict:
-    """Book rows plus the actual and trailing-average book returns.
-
-    Only book members (``w != 0``) are included, ordered longs-then-shorts
-    by conviction -- the same ordering as the rest of the review.  There is
-    no per-name *predicted* return: the model ranks direction, not
-    magnitude, so the only "expected" figure this can honestly offer is the
-    trailing realised average from :func:`review_history`.
-    """
-    longs, shorts = _order(r)
-    rows = []
-    for i in longs + shorts:
-        rows.append(dict(
-            ticker=C.JP_TICKERS[i],
-            label=C.JP_LABELS.get(C.JP_TICKERS[i], ""),
-            side="LONG" if r["w"][i] > 0 else "SHORT",
-            weight=float(r["w"][i]),
-            z_hat=float(r["z_hat"][i]),
-            roc=float(r["roc"][i]),
-            contrib=float(r["contrib"][i]),
-            hit=bool(np.sign(r["w"][i]) == np.sign(r["roc"][i])),
-        ))
-    return dict(
-        review_date=str(pd.Timestamp(r["review_date"]).date()),
-        signal_date=str(pd.Timestamp(r["signal_date"]).date()),
-        live=bool(r["live"]),
-        port_return=r["port_return"],
-        hist_mean=hist["mean"] if hist else None,
-        hist_n=hist["n"] if hist else None,
-        rows=rows,
-    )
-
-
-def build_calculator_html(r, hist=None) -> str:
-    """Standalone, self-contained HTML+JS "how much would I have made"
-    calculator for one reviewed session.
-
-    Enter a principal and it scales two already-computed numbers against
-    it: the session's *actual* book return (exact -- everything here has
-    already closed), and, for context, the trailing-average book return
-    from :func:`review_history` labelled as an estimate, not a forecast
-    (the model has no per-session return-magnitude prediction to draw on).
-    No network calls, no external assets -- opens from disk or as a
-    downloaded e-mail/Discord attachment.
-    """
-    data = _calculator_data(r, hist)
-    payload = json.dumps(data)
-    live_note = "" if data["live"] else (
-        '<p class="warn">⚠ SYNTHETIC fallback data -- for demonstration '
-        'only, do not use these figures for real decisions.</p>')
-
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Lead-Lag PCA -- P&amp;L simulator -- {data['review_date']}</title>
-<style>
-  body {{ font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-         max-width: 760px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }}
-  h1 {{ font-size: 1.3rem; margin-bottom: 4px; }}
-  .sub {{ color: #666; font-size: 0.85rem; margin-top: 0; }}
-  .warn {{ color: #92400e; background: #fef3c7; padding: 8px 12px;
-          border-radius: 6px; font-size: 0.9rem; }}
-  .note {{ color: #666; font-size: 0.8rem; }}
-  label {{ font-weight: 600; }}
-  input#principal {{ font-size: 1.1rem; padding: 6px 10px; width: 220px;
-                     margin-left: 8px; }}
-  .cards {{ display: flex; gap: 16px; margin: 20px 0; flex-wrap: wrap; }}
-  .card {{ flex: 1; min-width: 240px; border: 1px solid #ddd; border-radius: 8px;
-          padding: 14px 16px; }}
-  .card h2 {{ font-size: 0.9rem; margin: 0 0 6px; color: #444; }}
-  .card .amount {{ font-size: 1.6rem; font-weight: 700; }}
-  .pos {{ color: #2ca02c; }}
-  .neg {{ color: #d62728; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 8px; }}
-  th, td {{ padding: 5px 8px; text-align: right; border-bottom: 1px solid #eee; }}
-  th:first-child, td:first-child {{ text-align: left; }}
-  td.side-long {{ color: #2ca02c; font-weight: 600; }}
-  td.side-short {{ color: #d62728; font-weight: 600; }}
-  footer {{ margin-top: 24px; color: #999; font-size: 0.75rem; }}
-</style>
-</head>
-<body>
-<h1>Lead-Lag PCA_SUB -- P&amp;L simulator</h1>
-<p class="sub">Signal day {data['signal_date']} (U.S. close-to-close) &rarr;
-   reviewed session {data['review_date']} (Japanese open-to-close)</p>
-{live_note}
-<p><label for="principal">Principal</label>
-   <input id="principal" type="number" value="1000000" min="0" step="10000"></p>
-
-<div class="cards">
-  <div class="card">
-    <h2>Actual P&amp;L -- this session (exact)</h2>
-    <div class="amount" id="actual-amount">--</div>
-    <div class="note">book return <span id="actual-pct">--</span> = long leg &minus; short leg</div>
-  </div>
-  <div class="card">
-    <h2>Estimated P&amp;L -- trailing average</h2>
-    <div class="amount" id="est-amount">--</div>
-    <div class="note" id="est-note">--</div>
-  </div>
-</div>
-<p class="note">The model ranks direction (long/short), not the size of the move, so
-there is no per-session return forecast to scale. The "estimated" card instead
-projects the principal at the trailing mean daily book return as a track-record
-reference point, not a prediction for this specific session.</p>
-
-<table id="book">
-  <thead><tr><th>Ticker</th><th>Sector</th><th>Side</th><th>Weight</th>
-  <th>&Zcirc;</th><th>Realised %</th><th>Hit</th><th>P&amp;L</th></tr></thead>
-  <tbody></tbody>
-</table>
-
-<footer>Research output only -- not investment advice. Costs/slippage not modelled.</footer>
-
-<script>
-const DATA = {payload};
-
-function fmtMoney(x) {{
-  const sign = x < 0 ? "-" : "+";
-  return sign + Math.abs(x).toLocaleString(undefined, {{maximumFractionDigits: 0}});
-}}
-function fmtPct(x) {{
-  return (x >= 0 ? "+" : "") + (100 * x).toFixed(2) + "%";
-}}
-function colourClass(x) {{ return x >= 0 ? "pos" : "neg"; }}
-
-function render() {{
-  const principal = parseFloat(document.getElementById("principal").value) || 0;
-
-  const actual = principal * DATA.port_return;
-  const actualAmount = document.getElementById("actual-amount");
-  actualAmount.textContent = fmtMoney(actual);
-  actualAmount.className = "amount " + colourClass(actual);
-  document.getElementById("actual-pct").textContent = fmtPct(DATA.port_return);
-
-  const estAmount = document.getElementById("est-amount");
-  const estNote = document.getElementById("est-note");
-  if (DATA.hist_mean === null) {{
-    estAmount.textContent = "n/a";
-    estAmount.className = "amount";
-    estNote.textContent = "trailing history unavailable for this run";
-  }} else {{
-    const est = principal * DATA.hist_mean;
-    estAmount.textContent = fmtMoney(est);
-    estAmount.className = "amount " + colourClass(est);
-    estNote.textContent = `mean daily book return ${{fmtPct(DATA.hist_mean)}} `
-      + `over trailing ${{DATA.hist_n}} sessions`;
-  }}
-
-  const tbody = document.querySelector("#book tbody");
-  tbody.innerHTML = "";
-  for (const row of DATA.rows) {{
-    const tr = document.createElement("tr");
-    const pnl = principal * row.contrib;
-    tr.innerHTML = `<td>${{row.ticker}}</td><td>${{row.label}}</td>`
-      + `<td class="side-${{row.side.toLowerCase()}}">${{row.side}}</td>`
-      + `<td>${{row.weight.toFixed(3)}}</td>`
-      + `<td>${{row.z_hat.toFixed(3)}}</td>`
-      + `<td class="${{colourClass(row.roc)}}">${{fmtPct(row.roc)}}</td>`
-      + `<td>${{row.hit ? "OK" : "MISS"}}</td>`
-      + `<td class="${{colourClass(pnl)}}">${{fmtMoney(pnl)}}</td>`;
-    tbody.appendChild(tr);
-  }}
-}}
-
-document.getElementById("principal").addEventListener("input", render);
-render();
-</script>
-</body>
-</html>
-"""
-
-
-def save_calculator_html(r, path, hist=None):
-    """Write the standalone P&L calculator to ``path``."""
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(build_calculator_html(r, hist))
-    print(f"[calculator] written to {path}")
+def _pnl_table(ax, r):
+    """The yen P&L for :data:`PNL_AMOUNTS`, drawn as a table on ``ax``."""
+    ax.axis("off")
+    ax.set_title("P&L by amount  (amount bought long + same amount sold "
+                 "short, equal weight by name, open → close)", fontsize=10)
+    rows = pnl_by_amount(r)
+    cells = [[_yen(p["amount"], signed=False), _yen(p["long"]),
+              _yen(p["short"]), _yen(p["total"])] for p in rows]
+    table = ax.table(cellText=cells,
+                     colLabels=["amount (each side)", "long P&L",
+                                "short P&L", "total P&L"],
+                     cellLoc="right", colLoc="right", loc="center",
+                     bbox=[0.0, 0.0, 1.0, 0.92])
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    for (row, col), cell in table.get_celld().items():
+        cell.set_edgecolor("#d0d7de")
+        if row == 0:
+            cell.set_facecolor("#f0f2f5")
+            cell.set_text_props(fontweight="bold", color="#57606a")
+            continue
+        if col == 0:
+            continue
+        v = rows[row - 1][("long", "short", "total")[col - 1]]
+        cell.set_text_props(
+            fontfamily="monospace", fontweight="bold" if col == 3 else None,
+            color="#1a7f37" if v > 0 else ("#c11d2b" if v < 0 else "#57606a"))
 
 
 # ---------------------------------------------------------------------------
@@ -995,8 +912,6 @@ def main():
                     help="skip the network and use the synthetic fallback")
     ap.add_argument("--no-chart", action="store_true",
                     help="do not render or attach the chart")
-    ap.add_argument("--no-calculator", action="store_true",
-                    help="do not render or attach the P&L calculator")
     ap.add_argument("--skip-if-stale", type=int, default=-1, metavar="DAYS",
                     help="exit 0 without sending when the latest Japanese "
                          "session is more than DAYS calendar days old "
@@ -1046,11 +961,6 @@ def main():
         chart_path = os.path.join(out_dir, f"review_{d_str}.png")
         save_review_chart(r, chart_path, hist)
 
-    calc_path = None
-    if not args.no_calculator:
-        calc_path = os.path.join(out_dir, f"review_calc_{d_str}.html")
-        save_calculator_html(r, calc_path, hist)
-
     # --- deliver ----------------------------------------------------------
     channels = D.resolve_channels(args)
     delivered = False
@@ -1061,13 +971,6 @@ def main():
             subject_line(r), cfg["sender"], cfg["recipients"],
             render_text(r, hist), lambda cid: render_html(r, hist, cid),
             chart_path, filename="review.png")
-        if calc_path:
-            # A real attachment, not inlined into the HTML body: most mail
-            # clients strip <script> from HTML e-mails, so the calculator
-            # only works once the recipient downloads and opens it.
-            with open(calc_path, "rb") as fh:
-                msg.add_attachment(fh.read(), maintype="text", subtype="html",
-                                   filename=f"review_calc_{d_str}.html")
 
         dry = args.dry_run or not cfg["host"]
         if dry and not args.dry_run:
@@ -1093,10 +996,6 @@ def main():
         webhook = (args.discord_webhook
                    or os.environ.get("DISCORD_WEBHOOK_URL", "").strip())
         payload = build_discord_payload(r, hist, attach_chart=bool(chart_path))
-        if calc_path:
-            payload["embeds"][0]["footer"]["text"] += (
-                "  |  \U0001F4CE P&L simulator attached "
-                f"(review_calc_{d_str}.html) -- open in a browser.")
 
         dry = args.dry_run or not webhook
         if dry and not args.dry_run:
@@ -1109,12 +1008,7 @@ def main():
                                            date_key="review_date")
             print(f"[dry-run] discord payload written to {path}")
         else:
-            extra_files = None
-            if calc_path:
-                with open(calc_path, "rb") as fh:
-                    extra_files = [(f"review_calc_{d_str}.html", "text/html",
-                                    fh.read())]
-            D.post_discord(webhook, payload, chart_path, extra_files=extra_files)
+            D.post_discord(webhook, payload, chart_path)
             delivered = True
             print(f"[sent] discord: {payload['embeds'][0]['title']} "
                   f"-> {D.mask_webhook(webhook)}")

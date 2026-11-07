@@ -20,12 +20,19 @@ name: JP close review
 #     (a holiday, or a day the signal missed the open) -> nothing is sent;
 #   * a session already reviewed (this job's own cache) is not re-sent.
 #
-# Note also that GitHub disables scheduled workflows in a repository with no
-# activity for 60 days; push a commit or re-enable it from the Actions tab.
+# SCHEDULE DISABLED: the cron trigger is commented out below, so this
+# workflow only runs when started by hand (workflow_dispatch).  To resume
+# automatic runs, uncomment the `schedule:` block.  Note that GitHub also
+# disables scheduled workflows in a repository with no activity for 60 days.
+#
+# Manual runs: pass `auto: true` to behave like a scheduled run.  The state
+# kept in the Actions cache (last sent / delivered books) is evicted after
+# 7 days without access, so after a long pause an `auto` run may not know
+# what was already delivered.
 
 on:
-  schedule:
-    - cron: "17,47 7-12 * * 1-5"
+  # schedule:
+  #   - cron: "17,47 7-12 * * 1-5"
   workflow_dispatch:
     inputs:
       date:

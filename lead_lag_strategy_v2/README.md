@@ -206,7 +206,7 @@ MDD -9.58% と、リスク調整後リターンと最大ドローダウンの両
 | `realtime_run.py` | **リアルタイム実行**: 最新データ（yfinance、失敗時は合成）から現時点の因子構造・シグナル・翌日のロング/ショート建玉を出力。チャートを `output/` に保存 |
 | `daily_report.py` | **日次レポート**: シグナルをメール（HTML/テキスト、SMTP）と Discord（Embed、Webhook）のどちらか／両方で配信（第5節） |
 | `review_report.py` | **クローズ後レポート**: 日本市場の引け後に、配信済みの建玉が実際にどうなったか（円・％・寄与・当否）を同じチャネルで配信（第6節） |
-| `../.github/workflows/daily-signal.yml` | **日次自動実行**: GitHub Actions の cron で毎営業日 `daily_report.py` を実行（日本オープン前） |
+| `../.github/workflows/daily-signal.yml` | **日次自動実行**（現在 cron は無効化、手動実行のみ）: GitHub Actions で毎営業日 `daily_report.py` を実行（日本オープン前） |
 | `../.github/workflows/jp-close-review.yml` | **クローズ後自動実行**: 日本クローズ後に `review_report.py --auto` を実行。その日に配信した建玉があるときだけ予実を配信 |
 | `output/` | 生成されるチャート・図の出力先（git 管理外） |
 | `README.md` | 本ファイル |
@@ -500,6 +500,8 @@ POST し、JSON の Embed（`payload_json`）とチャート画像（`files[0]`�
 
 ### 5.6 GitHub Actions による自動実行
 
+> **現在 cron スケジュールは無効化**（`schedule:` をコメントアウト）しており、`workflow_dispatch` の手動実行のみ可能です。再開するには `.github/workflows/daily-signal.yml` の `schedule:` ブロックのコメントを外してください。以下は有効時の仕様です。
+
 `.github/workflows/daily-signal.yml` が `cron: "17,47 20-23 * * 1-5"`（UTC）で
 米国クローズ（EDT 20:00 / EST 21:00 UTC）から日本オープン（00:00 UTC =
 09:00 JST）まで30分おきに起動します。GitHub の cron は数時間遅れることが
@@ -633,6 +635,8 @@ python review_report.py --channels discord
 | `--history-days N` | 直近何セッション分の実績を集計するか（既定20、`0` で無効） |
 
 ### 6.4 GitHub Actions による自動実行
+
+> **現在 cron スケジュールは無効化**（`schedule:` をコメントアウト）しており、`workflow_dispatch` の手動実行のみ可能です。再開するには `.github/workflows/jp-close-review.yml` の `schedule:` ブロックのコメントを外してください。以下は有効時の仕様です。
 
 `.github/workflows/jp-close-review.yml` が `cron: "17,47 7-12 * * 1-5"`（UTC）で
 日本クローズ（15:30 JST = 06:30 UTC）の後、30分おきに起動します（GitHub の

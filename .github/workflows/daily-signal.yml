@@ -27,12 +27,19 @@ name: Daily lead-lag signal
 # Each delivered book is saved under state/books/ in the same cache, and
 # jp-close-review.yml scores exactly that book after the Japanese close.
 #
-# Note also that GitHub disables scheduled workflows in a repository with no
-# activity for 60 days; push a commit or re-enable it from the Actions tab.
+# SCHEDULE DISABLED: the cron trigger is commented out below, so this
+# workflow only runs when started by hand (workflow_dispatch).  To resume
+# automatic runs, uncomment the `schedule:` block.  Note that GitHub also
+# disables scheduled workflows in a repository with no activity for 60 days.
+#
+# Manual runs: pass `auto: true` to behave like a scheduled run.  The state
+# kept in the Actions cache (last sent / delivered books) is evicted after
+# 7 days without access, so after a long pause an `auto` run may not know
+# what was already delivered.
 
 on:
-  schedule:
-    - cron: "17,47 20-23 * * 1-5"
+  # schedule:
+  #   - cron: "17,47 20-23 * * 1-5"
   workflow_dispatch:
     inputs:
       date:
